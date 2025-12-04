@@ -36,11 +36,11 @@
   - Logging библиотека (например, `go.uber.org/zap`)
 
 ### 1.2. Конфигурация
-- [ ] Создать `internal/config/config.go` - загрузка конфигурации из YAML
-- [ ] Создать `internal/config/fees.go` - захардкодить комиссии бирж (taker fees)
-- [ ] Создать `configs/app.yaml` - основной конфигурационный файл (шаблон)
-- [ ] Создать `configs/exchanges.json` - минимумы и лимиты бирж (шаблон)
-- [ ] Реализовать загрузку переменных окружения для API ключей
+- [x] Создать `internal/config/config.go` - загрузка конфигурации из YAML
+- [x] Создать `internal/config/fees.go` - захардкодить комиссии бирж (taker fees)
+- [x] Создать `configs/app.yaml` - основной конфигурационный файл (шаблон)
+- [x] Создать `configs/exchanges.json` - минимумы и лимиты бирж (шаблон)
+- [x] Реализовать загрузку переменных окружения для API ключей
 
 ### 1.3. База данных
 - [ ] Создать `internal/db/models.go` - модели данных (PairConfig, Trade, LeverageCache)
