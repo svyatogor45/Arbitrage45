@@ -40,8 +40,13 @@ const (
 // Основные возможности:
 //   - Выставление и отмена ордеров (REST)
 //   - Получение баланса и позиций (REST)
-//   - Подписка на обновления стакана (WebSocket)
+//   - Подписка на обновления стакана (Public WebSocket)
+//   - Мониторинг позиций и ликвидаций (Private WebSocket)
 //   - Автоматический reconnect при разрыве соединения
+//
+// Согласно TZ.md 2.5C:
+// "Ликвидация: Если биржа ликвидировала одну позицию →
+//  Немедленно закрыть вторую позицию"
 //
 // Пример использования:
 //
@@ -58,10 +63,17 @@ const (
 //	}
 //	defer client.Close()
 //
+//	// Публичный WebSocket для рыночных данных
 //	client.SetPriceCallback(func(update *exchanges.PriceUpdate) {
 //	    fmt.Printf("Price update: %+v\n", update)
-//	    // ВАЖНО: вернуть update в пул после использования
 //	    exchanges.PutPriceUpdateWithOrderBook(update)
+//	})
+//
+//	// Приватный WebSocket для мониторинга ликвидаций
+//	client.SetPositionCallback(func(event *bybit.PositionEvent) {
+//	    if event.IsLiquidated {
+//	        fmt.Printf("Liquidation detected: %s\n", event.Symbol)
+//	    }
 //	})
 //
 //	client.Subscribe("BTCUSDT", "ETHUSDT")
@@ -70,11 +82,12 @@ const (
 //   - logger защищён через atomic.Value
 //   - connected защищён через sync.RWMutex
 type Client struct {
-	rest      *RestClient      // REST клиент для торговых операций
-	ws        *WebSocketClient // WebSocket клиент для потоков данных
-	logger    atomic.Value     // *zap.Logger (atomic для потокобезопасности)
-	connected bool             // Статус подключения
-	mu        sync.RWMutex     // Защита состояния
+	rest      *RestClient              // REST клиент для торговых операций
+	ws        *WebSocketClient         // Public WebSocket для рыночных данных
+	privateWs *PrivateWebSocketClient  // Private WebSocket для позиций/ликвидаций
+	logger    atomic.Value             // *zap.Logger (atomic для потокобезопасности)
+	connected bool                     // Статус подключения
+	mu        sync.RWMutex             // Защита состояния
 }
 
 // Config содержит конфигурацию для создания клиента Bybit.
@@ -141,7 +154,7 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("failed to create REST client: %w", err)
 	}
 
-	// Создаём WebSocket клиент (callback установим позже)
+	// Создаём Public WebSocket клиент (callback установим позже)
 	wsClient, err := NewWebSocketClient(WebSocketConfig{
 		URL:    cfg.WsURL,
 		Logger: logger,
@@ -154,9 +167,22 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("failed to create WebSocket client: %w", err)
 	}
 
+	// Создаём Private WebSocket клиент для мониторинга позиций и ликвидаций
+	// Согласно TZ.md 2.5C: "Ликвидация: Если биржа ликвидировала одну позицию →
+	// Немедленно закрыть вторую позицию"
+	privateWsClient, err := NewPrivateWebSocketClient(PrivateWebSocketConfig{
+		APIKey:    cfg.APIKey,
+		APISecret: cfg.APISecret,
+		Logger:    logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create private WebSocket client: %w", err)
+	}
+
 	client := &Client{
-		rest: restClient,
-		ws:   wsClient,
+		rest:      restClient,
+		ws:        wsClient,
+		privateWs: privateWsClient,
 	}
 	client.logger.Store(logger)
 
@@ -180,11 +206,12 @@ func (c *Client) GetName() string {
 	return ExchangeName
 }
 
-// Connect подключается к Bybit (REST проверка + WebSocket соединение).
+// Connect подключается к Bybit (REST проверка + WebSocket соединения).
 //
 // Метод выполняет:
 //  1. Проверку доступности REST API (ping)
-//  2. Установку WebSocket соединения
+//  2. Установку Public WebSocket соединения (рыночные данные)
+//  3. Установку Private WebSocket соединения (позиции, ликвидации)
 //
 // Возвращает ошибку, если подключение не удалось.
 func (c *Client) Connect() error {
@@ -205,18 +232,34 @@ func (c *Client) Connect() error {
 	}
 	c.getLogger().Info("Bybit REST API is available")
 
-	// Подключаем WebSocket
-	c.getLogger().Info("connecting to Bybit WebSocket")
+	// Подключаем Public WebSocket (рыночные данные)
+	c.getLogger().Info("connecting to Bybit Public WebSocket")
 	if err := c.ws.Connect(); err != nil {
-		return fmt.Errorf("WebSocket connection failed: %w", err)
+		return fmt.Errorf("public WebSocket connection failed: %w", err)
 	}
-	c.getLogger().Info("Bybit WebSocket connected")
+	c.getLogger().Info("Bybit Public WebSocket connected")
+
+	// Подключаем Private WebSocket (позиции, ликвидации)
+	// Согласно TZ.md 2.5C для мониторинга ликвидаций
+	c.getLogger().Info("connecting to Bybit Private WebSocket")
+	if err := c.privateWs.Connect(); err != nil {
+		// Private WS не критичен — логируем предупреждение, но не прерываем
+		c.getLogger().Warn("private WebSocket connection failed (liquidation monitoring unavailable)",
+			zap.Error(err),
+		)
+	} else {
+		c.getLogger().Info("Bybit Private WebSocket connected")
+	}
 
 	c.connected = true
 	return nil
 }
 
 // Close закрывает все соединения с Bybit.
+//
+// Закрывает в порядке:
+//  1. Private WebSocket (позиции, ликвидации)
+//  2. Public WebSocket (рыночные данные)
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -227,9 +270,16 @@ func (c *Client) Close() error {
 
 	c.getLogger().Info("closing Bybit connections")
 
-	// Закрываем WebSocket
+	// Закрываем Private WebSocket
+	if c.privateWs != nil {
+		if err := c.privateWs.Close(); err != nil {
+			c.getLogger().Warn("error closing private WebSocket", zap.Error(err))
+		}
+	}
+
+	// Закрываем Public WebSocket
 	if err := c.ws.Close(); err != nil {
-		c.getLogger().Warn("error closing WebSocket", zap.Error(err))
+		c.getLogger().Warn("error closing public WebSocket", zap.Error(err))
 	}
 
 	c.connected = false
@@ -611,9 +661,82 @@ func (c *Client) GetSubscriptions() []string {
 	return c.ws.GetSubscriptions()
 }
 
-// IsWebSocketConnected возвращает статус WebSocket соединения.
+// IsWebSocketConnected возвращает статус Public WebSocket соединения.
 func (c *Client) IsWebSocketConnected() bool {
 	return c.ws.IsConnected()
+}
+
+// =============================================================================
+// Методы Private WebSocket (мониторинг позиций и ликвидаций)
+// =============================================================================
+
+// SetPositionCallback устанавливает callback для обновлений позиций.
+//
+// Callback вызывается при любом изменении позиции, включая ликвидации.
+// Согласно TZ.md 2.5C: "Ликвидация: Если биржа ликвидировала одну позицию →
+// Немедленно закрыть вторую позицию"
+//
+// Пример использования для мониторинга ликвидаций:
+//
+//	client.SetPositionCallback(func(event *bybit.PositionEvent) {
+//	    if event.IsLiquidated {
+//	        log.Printf("LIQUIDATION: %s %s", event.Symbol, event.Side)
+//	        // Закрываем противоположную позицию на другой бирже
+//	        arbitrage.HandleLiquidation(event.Symbol)
+//	    }
+//	})
+//
+// Потокобезопасен — можно вызывать из любой горутины.
+func (c *Client) SetPositionCallback(callback func(*PositionEvent)) {
+	if c.privateWs != nil {
+		c.privateWs.SetPositionCallback(callback)
+	}
+}
+
+// SetExecutionCallback устанавливает callback для исполнений ордеров.
+//
+// Callback вызывается при каждом исполнении ордера (частичном или полном).
+// Может использоваться для отслеживания исполнений и ликвидаций.
+//
+// Пример:
+//
+//	client.SetExecutionCallback(func(event *bybit.ExecutionEvent) {
+//	    if event.IsLiquidation {
+//	        log.Printf("LIQUIDATION EXECUTION: %s", event.OrderID)
+//	    }
+//	})
+//
+// Потокобезопасен — можно вызывать из любой горутины.
+func (c *Client) SetExecutionCallback(callback func(*ExecutionEvent)) {
+	if c.privateWs != nil {
+		c.privateWs.SetExecutionCallback(callback)
+	}
+}
+
+// SetPrivateErrorCallback устанавливает callback для ошибок Private WebSocket.
+//
+// Вызывается при невозможности восстановить приватное соединение.
+// Рекомендуется логировать и уведомлять о проблемах с мониторингом ликвидаций.
+func (c *Client) SetPrivateErrorCallback(callback func(error)) {
+	if c.privateWs != nil {
+		c.privateWs.SetErrorCallback(callback)
+	}
+}
+
+// IsPrivateWebSocketConnected возвращает статус Private WebSocket соединения.
+//
+// Если false — мониторинг ликвидаций недоступен.
+func (c *Client) IsPrivateWebSocketConnected() bool {
+	if c.privateWs == nil {
+		return false
+	}
+	return c.privateWs.IsConnected()
+}
+
+// GetPrivateWebSocketClient возвращает Private WebSocket клиент для прямого использования.
+// Используйте с осторожностью — предпочитайте методы Client.
+func (c *Client) GetPrivateWebSocketClient() *PrivateWebSocketClient {
+	return c.privateWs
 }
 
 // =============================================================================
@@ -654,6 +777,9 @@ func (c *Client) SetLogger(logger *zap.Logger) {
 		c.logger.Store(logger)
 		c.rest.SetLogger(logger)
 		c.ws.SetLogger(logger)
+		if c.privateWs != nil {
+			c.privateWs.SetLogger(logger)
+		}
 	}
 }
 
