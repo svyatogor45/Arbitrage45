@@ -6,7 +6,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,13 +13,20 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"arbitrage-terminal/internal/exchanges"
 	"arbitrage-terminal/pkg/metrics"
 	"arbitrage-terminal/pkg/ratelimit"
+
+	jsoniter "github.com/json-iterator/go"
 	"go.uber.org/zap"
 )
+
+// jsonFastREST — настроенный экземпляр jsoniter для REST API.
+// Используется вместо стандартного encoding/json для достижения латентности < 0.1ms.
+var jsonFastREST = jsoniter.ConfigCompatibleWithStandardLibrary
 
 // =============================================================================
 // Константы REST клиента
@@ -54,6 +60,10 @@ const (
 
 // RestClient реализует взаимодействие с Bybit REST API V5.
 // Поддерживает подпись запросов HMAC-SHA256 и rate limiting.
+//
+// Потокобезопасность:
+//   - logger защищён через atomic.Value
+//   - rateLimiter потокобезопасен
 type RestClient struct {
 	httpClient  *http.Client       // HTTP клиент
 	baseURL     string             // Базовый URL API
@@ -61,7 +71,7 @@ type RestClient struct {
 	apiSecret   string             // API секрет
 	recvWindow  int                // Окно приёма (мс)
 	rateLimiter *ratelimit.Limiter // Rate limiter
-	logger      *zap.Logger        // Логгер
+	logger      atomic.Value       // *zap.Logger (atomic для потокобезопасности)
 }
 
 // RestClientConfig содержит конфигурацию для создания REST клиента.
@@ -123,15 +133,25 @@ func NewRestClient(cfg RestClientConfig) (*RestClient, error) {
 	// Создание rate limiter (60 запросов в минуту, burst = 10)
 	limiter := ratelimit.NewLimiter(RateLimitRequests, RateLimitBurst, RateLimitPeriod)
 
-	return &RestClient{
+	client := &RestClient{
 		httpClient:  httpClient,
 		baseURL:     baseURL,
 		apiKey:      cfg.APIKey,
 		apiSecret:   cfg.APISecret,
 		recvWindow:  recvWindow,
 		rateLimiter: limiter,
-		logger:      logger,
-	}, nil
+	}
+	client.logger.Store(logger)
+
+	return client, nil
+}
+
+// getLogger возвращает текущий логгер (потокобезопасно).
+func (c *RestClient) getLogger() *zap.Logger {
+	if l := c.logger.Load(); l != nil {
+		return l.(*zap.Logger)
+	}
+	return zap.NewNop()
 }
 
 // =============================================================================
@@ -195,7 +215,7 @@ func (c *RestClient) doRequest(ctx context.Context, method, endpoint string, par
 	} else {
 		// Для POST запросов параметры идут в JSON body
 		if len(params) > 0 {
-			jsonData, err := json.Marshal(params)
+			jsonData, err := jsonFastREST.Marshal(params)
 			if err != nil {
 				return fmt.Errorf("failed to marshal request body: %w", err)
 			}
@@ -221,7 +241,7 @@ func (c *RestClient) doRequest(ctx context.Context, method, endpoint string, par
 	req.Header.Set("X-BAPI-RECV-WINDOW", strconv.Itoa(c.recvWindow))
 
 	// Логируем запрос (без секретных данных)
-	c.logger.Debug("bybit REST request",
+	c.getLogger().Debug("bybit REST request",
 		zap.String("method", method),
 		zap.String("endpoint", endpoint),
 		zap.Int64("timestamp", timestamp),
@@ -233,7 +253,7 @@ func (c *RestClient) doRequest(ctx context.Context, method, endpoint string, par
 	duration := time.Since(startTime)
 
 	if err != nil {
-		c.logger.Error("bybit REST request failed",
+		c.getLogger().Error("bybit REST request failed",
 			zap.String("endpoint", endpoint),
 			zap.Duration("duration", duration),
 			zap.Error(err),
@@ -257,7 +277,7 @@ func (c *RestClient) doRequest(ctx context.Context, method, endpoint string, par
 	}
 
 	// Логируем ответ
-	c.logger.Debug("bybit REST response",
+	c.getLogger().Debug("bybit REST response",
 		zap.String("endpoint", endpoint),
 		zap.Int("status", resp.StatusCode),
 		zap.Duration("duration", duration),
@@ -286,7 +306,7 @@ func (c *RestClient) doRequest(ctx context.Context, method, endpoint string, par
 		// Пытаемся извлечь сообщение из ответа
 		var errMsg string
 		var baseResp APIResponseRaw
-		if json.Unmarshal(respBody, &baseResp) == nil && baseResp.RetMsg != "" {
+		if jsonFastREST.Unmarshal(respBody, &baseResp) == nil && baseResp.RetMsg != "" {
 			errMsg = baseResp.RetMsg
 		} else {
 			// Ограничиваем длину ответа для логирования
@@ -297,7 +317,7 @@ func (c *RestClient) doRequest(ctx context.Context, method, endpoint string, par
 			errMsg = string(respBody[:maxLen])
 		}
 
-		c.logger.Warn("bybit HTTP error",
+		c.getLogger().Warn("bybit HTTP error",
 			zap.Int("status", resp.StatusCode),
 			zap.String("endpoint", endpoint),
 			zap.String("message", errMsg),
@@ -311,11 +331,13 @@ func (c *RestClient) doRequest(ctx context.Context, method, endpoint string, par
 		}
 	}
 
-	// Парсим базовый ответ для проверки бизнес-ошибок
+	// Парсим базовый ответ для проверки бизнес-ошибок (с метрикой)
+	parseTimer := metrics.NewTimer()
 	var baseResp APIResponseRaw
-	if err := json.Unmarshal(respBody, &baseResp); err != nil {
+	if err := jsonFastREST.Unmarshal(respBody, &baseResp); err != nil {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
+	metrics.JSONParsingDuration.WithLabelValues(ExchangeName, "rest_base").Observe(parseTimer.ElapsedMs())
 
 	// Проверяем код возврата API
 	if baseResp.RetCode != RetCodeSuccess {
@@ -324,9 +346,11 @@ func (c *RestClient) doRequest(ctx context.Context, method, endpoint string, par
 
 	// Десериализуем результат, если указан
 	if result != nil {
-		if err := json.Unmarshal(respBody, result); err != nil {
+		resultTimer := metrics.NewTimer()
+		if err := jsonFastREST.Unmarshal(respBody, result); err != nil {
 			return fmt.Errorf("failed to parse result: %w", err)
 		}
+		metrics.JSONParsingDuration.WithLabelValues(ExchangeName, "rest_result").Observe(resultTimer.ElapsedMs())
 	}
 
 	return nil
@@ -406,7 +430,7 @@ func (c *RestClient) handleAPIError(endpoint string, code int, msg string) *exch
 		metrics.IncrementAPIError(ExchangeName, endpoint, "other")
 	}
 
-	c.logger.Warn("bybit API error",
+	c.getLogger().Warn("bybit API error",
 		zap.Int("code", code),
 		zap.String("message", msg),
 		zap.String("endpoint", endpoint),
@@ -491,7 +515,7 @@ func (c *RestClient) PlaceOrder(ctx context.Context, req *PlaceOrderRequest) (*P
 	// Записываем метрику успешного ордера
 	metrics.ObserveOrderExecution(ExchangeName, req.Symbol, req.Side, "success", timer.ElapsedMs())
 
-	c.logger.Info("bybit order placed",
+	c.getLogger().Info("bybit order placed",
 		zap.String("symbol", req.Symbol),
 		zap.String("side", req.Side),
 		zap.String("qty", req.Qty),
@@ -519,7 +543,7 @@ func (c *RestClient) CancelOrder(ctx context.Context, symbol, orderID string) er
 		return err
 	}
 
-	c.logger.Info("bybit order cancelled",
+	c.getLogger().Info("bybit order cancelled",
 		zap.String("symbol", symbol),
 		zap.String("orderId", orderID),
 	)
@@ -633,7 +657,7 @@ func (c *RestClient) SetLeverage(ctx context.Context, symbol string, leverage in
 		// Если плечо уже установлено — это не ошибка
 		if exchErr, ok := err.(*exchanges.ExchangeError); ok {
 			if exchErr.Code == ErrCodeLeverageNotChanged {
-				c.logger.Debug("bybit leverage already set",
+				c.getLogger().Debug("bybit leverage already set",
 					zap.String("symbol", symbol),
 					zap.Int("leverage", leverage),
 				)
@@ -643,7 +667,7 @@ func (c *RestClient) SetLeverage(ctx context.Context, symbol string, leverage in
 		return err
 	}
 
-	c.logger.Info("bybit leverage set",
+	c.getLogger().Info("bybit leverage set",
 		zap.String("symbol", symbol),
 		zap.Int("leverage", leverage),
 	)
@@ -763,8 +787,11 @@ func (c *RestClient) GetRateLimiter() *ratelimit.Limiter {
 }
 
 // SetLogger устанавливает логгер.
+// Потокобезопасен — можно вызывать из любой горутины.
 func (c *RestClient) SetLogger(logger *zap.Logger) {
-	c.logger = logger
+	if logger != nil {
+		c.logger.Store(logger)
+	}
 }
 
 // Ping проверяет доступность API (через запрос времени сервера).
