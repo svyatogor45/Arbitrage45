@@ -202,7 +202,14 @@ func ParseOrderbookMessage(data []byte) (*exchanges.PriceUpdate, error) {
 
 // parseLevelsInto преобразует уровни стакана напрямую в существующий слайс.
 // Оптимизировано для минимизации аллокаций.
+//
+// ВАЖНО: Функция очищает target перед использованием для избежания
+// загрязнения данными из предыдущего использования объекта пула.
 func parseLevelsInto(levels [][]string, target *[]exchanges.Level) error {
+	// Очищаем слайс перед использованием (критично для объектов из пула!)
+	// Используем [:0] для сохранения capacity
+	*target = (*target)[:0]
+
 	if len(levels) == 0 {
 		return nil
 	}
