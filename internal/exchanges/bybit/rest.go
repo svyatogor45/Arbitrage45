@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"sort"
@@ -82,25 +83,27 @@ const (
 //
 // Особенности:
 //   - Раздельные rate limiters для trade и query операций
-//   - Автоматический retry для retryable ошибок
+//   - Автоматический retry для retryable ошибок с jitter
 //   - Таймаут управляется через контекст (не HTTP клиентом)
 //
 // Потокобезопасность:
+//   - Все поля защищены через atomic или являются immutable
 //   - logger защищён через atomic.Value
+//   - retryEnabled, maxRetries защищены через atomic
 //   - Rate limiters потокобезопасны
 //   - HTTP клиент потокобезопасен
 type RestClient struct {
-	httpClient       *http.Client       // HTTP клиент (без глобального timeout)
-	baseURL          string             // Базовый URL API
-	apiKey           string             // API ключ
-	apiSecret        string             // API секрет
-	recvWindow       int                // Окно приёма (мс)
-	tradeLimiter     *ratelimit.Limiter // Rate limiter для торговых операций
-	queryLimiter     *ratelimit.Limiter // Rate limiter для read операций
-	logger           atomic.Value       // *zap.Logger (atomic для потокобезопасности)
-	retryEnabled     bool               // Флаг включения retry
-	maxRetries       int                // Максимальное количество retry
-	initialRetryDelay time.Duration     // Начальная задержка retry
+	httpClient        *http.Client       // HTTP клиент (без глобального timeout)
+	baseURL           string             // Базовый URL API
+	apiKey            string             // API ключ
+	apiSecret         string             // API секрет
+	recvWindow        int                // Окно приёма (мс)
+	tradeLimiter      *ratelimit.Limiter // Rate limiter для торговых операций
+	queryLimiter      *ratelimit.Limiter // Rate limiter для read операций
+	logger            atomic.Value       // *zap.Logger (atomic для потокобезопасности)
+	retryEnabled      atomic.Bool        // Флаг включения retry (atomic для потокобезопасности)
+	maxRetries        atomic.Int32       // Максимальное количество retry (atomic)
+	initialRetryDelay time.Duration      // Начальная задержка retry (immutable после создания)
 }
 
 // RestClientConfig содержит конфигурацию для создания REST клиента.
@@ -194,11 +197,13 @@ func NewRestClient(cfg RestClientConfig) (*RestClient, error) {
 		recvWindow:        recvWindow,
 		tradeLimiter:      tradeLimiter,
 		queryLimiter:      queryLimiter,
-		retryEnabled:      retryEnabled,
-		maxRetries:        maxRetries,
 		initialRetryDelay: initialRetryDelay,
 	}
+
+	// Устанавливаем atomic значения
 	client.logger.Store(logger)
+	client.retryEnabled.Store(retryEnabled)
+	client.maxRetries.Store(int32(maxRetries))
 
 	return client, nil
 }
@@ -267,15 +272,22 @@ func (c *RestClient) doRequest(ctx context.Context, method, endpoint string, par
 
 // doRequestWithRetry выполняет запрос с автоматическим retry для retryable ошибок.
 //
-// Реализует exponential backoff согласно TZ.md:
+// Реализует exponential backoff с jitter согласно TZ.md:
 // "Retry с exponential backoff для сетевых запросов"
+//
+// Jitter добавляется для предотвращения thundering herd при массовых retry.
+// Формула: backoff + random(0, backoff/4)
 func (c *RestClient) doRequestWithRetry(ctx context.Context, method, endpoint string, params map[string]interface{}, result interface{}, isTrade bool) error {
 	var lastErr error
 	backoff := c.initialRetryDelay
 
+	// Читаем настройки retry через atomic (потокобезопасно)
+	retryEnabled := c.retryEnabled.Load()
+	maxRetries := int(c.maxRetries.Load())
+
 	maxAttempts := 1
-	if c.retryEnabled {
-		maxAttempts = c.maxRetries + 1
+	if retryEnabled {
+		maxAttempts = maxRetries + 1
 	}
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -307,22 +319,28 @@ func (c *RestClient) doRequestWithRetry(ctx context.Context, method, endpoint st
 			break
 		}
 
+		// Добавляем jitter для предотвращения thundering herd
+		// Jitter = random(0, backoff/4) — до 25% от backoff
+		jitter := time.Duration(rand.Int63n(int64(backoff / 4)))
+		waitTime := backoff + jitter
+
 		c.getLogger().Warn("retry запроса",
 			zap.String("endpoint", endpoint),
 			zap.Int("attempt", attempt),
 			zap.Int("maxAttempts", maxAttempts),
 			zap.Duration("backoff", backoff),
+			zap.Duration("jitter", jitter),
 			zap.Error(err),
 		)
 
-		// Ждём перед retry с exponential backoff
+		// Ждём перед retry с exponential backoff + jitter
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(backoff):
+		case <-time.After(waitTime):
 		}
 
-		// Увеличиваем backoff для следующей попытки
+		// Увеличиваем backoff для следующей попытки (exponential)
 		backoff *= 2
 		if backoff > MaxRetryDelay {
 			backoff = MaxRetryDelay
@@ -1006,13 +1024,27 @@ func (c *RestClient) Ping(ctx context.Context) error {
 }
 
 // SetRetryEnabled включает или выключает retry для запросов.
+// Потокобезопасен — можно вызывать из любой горутины.
 func (c *RestClient) SetRetryEnabled(enabled bool) {
-	c.retryEnabled = enabled
+	c.retryEnabled.Store(enabled)
 }
 
 // SetMaxRetries устанавливает максимальное количество retry.
+// Потокобезопасен — можно вызывать из любой горутины.
 func (c *RestClient) SetMaxRetries(maxRetries int) {
 	if maxRetries >= 0 {
-		c.maxRetries = maxRetries
+		c.maxRetries.Store(int32(maxRetries))
 	}
+}
+
+// GetRetryEnabled возвращает текущее состояние retry.
+// Потокобезопасен.
+func (c *RestClient) GetRetryEnabled() bool {
+	return c.retryEnabled.Load()
+}
+
+// GetMaxRetries возвращает текущее максимальное количество retry.
+// Потокобезопасен.
+func (c *RestClient) GetMaxRetries() int {
+	return int(c.maxRetries.Load())
 }
