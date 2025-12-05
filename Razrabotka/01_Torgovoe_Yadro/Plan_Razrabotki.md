@@ -122,7 +122,7 @@
 **ВАЖНО:** Разрабатывать коннекторы ПОСЛЕДОВАТЕЛЬНО. Начать с одной биржи (Bybit), протестировать, затем переходить к следующей. Это минимизирует ошибки и переписывание кода.
 
 ### 4.1. Bybit коннектор (первый, самый детальный)
-- [ ] Создать `internal/exchanges/bybit/types.go`:
+- [x] Создать `internal/exchanges/bybit/types.go`:
   - Специфичные типы для Bybit API
   - `BybitOrderResponse`, `BybitWebSocketMessage`
 - [ ] Создать `internal/exchanges/bybit/rest.go`:
