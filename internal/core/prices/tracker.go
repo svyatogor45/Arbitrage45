@@ -100,6 +100,12 @@ func (t *Tracker) GetBestPrices() *BestPrices {
 		return nil
 	}
 
+	// КРИТИЧНО: для кросс-биржевого арбитража биржи ДОЛЖНЫ быть разными
+	// Если лучшие цены на одной бирже - арбитраж невозможен
+	if cheapestExchange == dearestExchange {
+		return nil
+	}
+
 	// Защита от деления на ноль
 	if cheapestAsk == 0 {
 		return nil

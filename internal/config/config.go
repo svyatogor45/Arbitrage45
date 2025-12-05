@@ -151,6 +151,13 @@ func (c *Config) Validate() error {
 	if !validLevels[c.Logging.Level] {
 		return fmt.Errorf("logging.level должен быть одним из: debug, info, warn, error")
 	}
+	validFormats := map[string]bool{"json": true, "console": true}
+	if !validFormats[c.Logging.Format] {
+		return fmt.Errorf("logging.format должен быть одним из: json, console")
+	}
+	if c.Logging.Output == "" {
+		return fmt.Errorf("logging.output не может быть пустым")
+	}
 
 	return nil
 }

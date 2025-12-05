@@ -1,6 +1,7 @@
 package exchanges
 
 import (
+	"strings"
 	"time"
 )
 
@@ -212,20 +213,22 @@ var exchangeSymbolFormats = map[string]SymbolFormat{
 func NormalizeSymbol(symbol string) string {
 	// Удалить известные суффиксы
 	for _, suffix := range []string{"-SWAP", "_SWAP", "-PERP", "_PERP"} {
-		if len(symbol) > len(suffix) && symbol[len(symbol)-len(suffix):] == suffix {
+		if strings.HasSuffix(symbol, suffix) {
 			symbol = symbol[:len(symbol)-len(suffix)]
+			break // Достаточно удалить один суффикс
 		}
 	}
 
-	// Заменить разделители на пустую строку
-	result := ""
+	// Заменить разделители на пустую строку (оптимизировано через strings.Builder)
+	var result strings.Builder
+	result.Grow(len(symbol)) // Предвыделение памяти
 	for _, r := range symbol {
 		if r != '-' && r != '_' {
-			result += string(r)
+			result.WriteRune(r)
 		}
 	}
 
-	return result
+	return result.String()
 }
 
 // FormatSymbolForExchange преобразует унифицированный символ (BTCUSDT) в формат биржи.
@@ -263,7 +266,7 @@ func extractBaseQuote(symbol string) (base, quote string) {
 	quotes := []string{"USDT", "BUSD", "USDC", "USD"}
 
 	for _, q := range quotes {
-		if len(symbol) > len(q) && symbol[len(symbol)-len(q):] == q {
+		if strings.HasSuffix(symbol, q) && len(symbol) > len(q) {
 			return symbol[:len(symbol)-len(q)], q
 		}
 	}
