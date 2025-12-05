@@ -204,16 +204,3 @@ func (d *DatabaseConfig) GetDSN() string {
 		d.DBName,
 	)
 }
-
-// GetMigrateDSN возвращает строку подключения для golang-migrate в формате postgres://
-// URL-кодирует спецсимволы в user/password для корректного парсинга.
-func (d *DatabaseConfig) GetMigrateDSN() string {
-	return fmt.Sprintf(
-		"postgres://%s:%s@%s:%d/%s?sslmode=disable",
-		url.QueryEscape(d.User),
-		url.QueryEscape(d.Password),
-		d.Host,
-		d.Port,
-		d.DBName,
-	)
-}

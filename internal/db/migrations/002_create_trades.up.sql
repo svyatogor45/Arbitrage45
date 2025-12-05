@@ -18,7 +18,6 @@ CREATE TABLE trades (
 -- Индексы для оптимизации запросов
 CREATE INDEX idx_trades_pair_id ON trades(pair_id);
 CREATE INDEX idx_trades_entry_time ON trades(entry_time);
-CREATE INDEX idx_trades_exit_time ON trades(exit_time);
 
 -- Комментарии к таблице и колонкам
 COMMENT ON TABLE trades IS 'История арбитражных сделок';
