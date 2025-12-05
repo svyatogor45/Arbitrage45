@@ -147,7 +147,7 @@
     - `resubscribe()` - восстановление подписок
     - `sendPing()` - ping/pong для поддержания соединения
   - Callback для отправки PriceUpdate в aggregator
-- [ ] Создать `internal/exchanges/bybit/bybit.go`:
+- [x] Создать `internal/exchanges/bybit/bybit.go`:
   - Главный клиент `Client` (реализация интерфейса Exchange)
   - Инициализация REST и WebSocket клиентов
   - Реализация всех методов интерфейса
