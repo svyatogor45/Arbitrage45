@@ -3,6 +3,7 @@ package bybit
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -281,6 +282,13 @@ func (c *Client) Close() error {
 		c.getLogger().Warn("error closing public WebSocket", zap.Error(err))
 	}
 
+	// Закрываем REST клиент (освобождаем HTTP соединения)
+	if c.rest != nil {
+		if err := c.rest.Close(); err != nil {
+			c.getLogger().Warn("error closing REST client", zap.Error(err))
+		}
+	}
+
 	c.connected = false
 	c.getLogger().Info("Bybit connections closed")
 
@@ -315,13 +323,29 @@ func (c *Client) PlaceOrder(req *exchanges.OrderRequest) (*exchanges.OrderRespon
 	// Запускаем таймер для метрики tick-to-order
 	timer := metrics.NewTimer()
 
+	// Валидация и округление согласно минимумам биржи
+	// Согласно Requirements.md: "ValidateVolume(symbol, exchange, volume) - проверка минимальных объёмов"
+	limits, err := c.GetInstrumentLimits(req.Symbol)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось получить лимиты инструмента: %w", err)
+	}
+
+	// Проверяем минимальный объём
+	if req.Quantity < limits.MinQty {
+		return nil, fmt.Errorf("объём %.8f меньше минимума %.8f для %s",
+			req.Quantity, limits.MinQty, req.Symbol)
+	}
+
+	// Округляем объём до QtyStep
+	quantity := roundToStep(req.Quantity, limits.QtyStep)
+
 	// Конвертируем запрос в формат Bybit
 	bybitReq := &PlaceOrderRequest{
 		Category:    CategoryLinear,
 		Symbol:      req.Symbol,
 		Side:        ToBybitSide(req.Side),
 		OrderType:   ToBybitOrderType(req.Type),
-		Qty:         FormatFloat(req.Quantity, 8), // 8 знаков после запятой для объёма
+		Qty:         FormatFloat(quantity, 8), // Округлённый объём
 		PositionIdx: ToBybitPositionIdx(req.PositionSide),
 	}
 
@@ -472,12 +496,17 @@ func (c *Client) WaitOrderFilled(symbol, orderID string, timeout time.Duration) 
 				return ParseOrderResponse(orderInfo)
 
 			case OrderStatusPartiallyFilled:
-				// Частичное исполнение — продолжаем ждать
-				c.getLogger().Debug("ордер частично исполнен, ожидаем",
+				// Согласно TZ.md раздел 6: "Упрощения: Рыночные ордера всегда исполняются
+				// полностью (не обрабатываем partial fill в первой версии)"
+				//
+				// Для market ордеров принимаем partial fill как успешное исполнение,
+				// чтобы не пропустить окно арбитража из-за недостаточной ликвидности.
+				c.getLogger().Warn("market ордер частично исполнен, принимаем как полный (согласно TZ.md)",
 					zap.String("orderId", orderID),
 					zap.String("filledQty", orderInfo.CumExecQty),
+					zap.String("orderQty", orderInfo.Qty),
 				)
-				continue
+				return ParseOrderResponse(orderInfo)
 
 			case OrderStatusCancelled, OrderStatusDeactivated, OrderStatusRejected:
 				// Ордер отменён или отклонён
@@ -780,6 +809,19 @@ func (c *Client) SetLogger(logger *zap.Logger) {
 			c.privateWs.SetLogger(logger)
 		}
 	}
+}
+
+// =============================================================================
+// Helper-функции
+// =============================================================================
+
+// roundToStep округляет значение до ближайшего кратного step.
+// Используется для округления объёма и цены согласно лимитам биржи.
+func roundToStep(value, step float64) float64 {
+	if step == 0 {
+		return value
+	}
+	return math.Round(value/step) * step
 }
 
 // =============================================================================
