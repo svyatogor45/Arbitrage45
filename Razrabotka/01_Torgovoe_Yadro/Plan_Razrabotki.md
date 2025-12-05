@@ -82,10 +82,10 @@
   - Методы `Subscribe(symbol)`, `handlePriceUpdate()`
 
 ### 2.3. State Machine
-- [ ] Создать `internal/state/machine.go`:
+- [x] Создать `internal/state/machine.go`:
   - Определить enum состояний: PAUSED, READY, ENTERING, POSITION_OPEN, EXITING, ERROR
   - Тип `Machine` с методами `Transition()`, `CurrentState()`, `CanTransition()`
-- [ ] Создать `internal/state/transitions.go`:
+- [x] Создать `internal/state/transitions.go`:
   - Определить разрешённые переходы между состояниями (map)
 
 ---
