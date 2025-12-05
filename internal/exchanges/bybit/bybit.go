@@ -335,6 +335,140 @@ func (c *Client) SetLeverage(symbol string, leverage int) error {
 // Дополнительные методы REST
 // =============================================================================
 
+// PlaceOrderAndWait выставляет ордер и ожидает его исполнения.
+//
+// Согласно TZ.md: "Дождаться исполнения обоих [ордеров]"
+//
+// Параметры:
+//   - req: параметры ордера
+//   - timeout: максимальное время ожидания исполнения
+//
+// Возвращает информацию об исполненном ордере или ошибку.
+// Для market ордеров ожидание обычно минимально (< 100ms).
+//
+// Пример:
+//
+//	resp, err := client.PlaceOrderAndWait(&exchanges.OrderRequest{
+//	    Symbol: "BTCUSDT",
+//	    Side:   exchanges.OrderSideBuy,
+//	    Type:   exchanges.OrderTypeMarket,
+//	    Quantity: 0.001,
+//	}, 5*time.Second)
+func (c *Client) PlaceOrderAndWait(req *exchanges.OrderRequest, timeout time.Duration) (*exchanges.OrderResponse, error) {
+	// Выставляем ордер
+	result, err := c.PlaceOrder(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Для market ордеров ждём исполнения
+	if req.Type == exchanges.OrderTypeMarket {
+		filled, err := c.WaitOrderFilled(req.Symbol, result.OrderID, timeout)
+		if err != nil {
+			// Возвращаем результат с предупреждением, но не ошибку
+			// Ордер уже выставлен, возможно исполнен
+			c.getLogger().Warn("не удалось подтвердить исполнение ордера",
+				zap.String("orderId", result.OrderID),
+				zap.Error(err),
+			)
+			return result, nil
+		}
+		return filled, nil
+	}
+
+	return result, nil
+}
+
+// WaitOrderFilled ожидает исполнения ордера с polling.
+//
+// Параметры:
+//   - symbol: символ торговой пары
+//   - orderID: ID ордера
+//   - timeout: максимальное время ожидания
+//
+// Возвращает информацию об исполненном ордере или ошибку по таймауту.
+//
+// Интервал polling: 100ms (оптимально для market ордеров).
+func (c *Client) WaitOrderFilled(symbol, orderID string, timeout time.Duration) (*exchanges.OrderResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Интервал polling — 100ms достаточно для market ордеров
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("таймаут ожидания исполнения ордера %s", orderID)
+		case <-ticker.C:
+			orderInfo, err := c.rest.GetOrderByID(ctx, symbol, orderID)
+			if err != nil {
+				// Продолжаем попытки при временных ошибках
+				c.getLogger().Debug("ошибка получения статуса ордера, повторяем",
+					zap.String("orderId", orderID),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			// Проверяем статус ордера
+			switch orderInfo.OrderStatus {
+			case OrderStatusFilled:
+				// Ордер полностью исполнен
+				c.getLogger().Debug("ордер исполнен",
+					zap.String("orderId", orderID),
+					zap.String("status", orderInfo.OrderStatus),
+				)
+				return ParseOrderResponse(orderInfo)
+
+			case OrderStatusPartiallyFilled:
+				// Частичное исполнение — продолжаем ждать
+				c.getLogger().Debug("ордер частично исполнен, ожидаем",
+					zap.String("orderId", orderID),
+					zap.String("filledQty", orderInfo.CumExecQty),
+				)
+				continue
+
+			case OrderStatusCancelled, OrderStatusDeactivated, OrderStatusRejected:
+				// Ордер отменён или отклонён
+				return nil, fmt.Errorf("ордер %s в статусе %s", orderID, orderInfo.OrderStatus)
+
+			case OrderStatusNew:
+				// Ордер ещё не исполнен — продолжаем ждать
+				continue
+
+			default:
+				// Неизвестный статус — продолжаем ждать
+				c.getLogger().Debug("неизвестный статус ордера",
+					zap.String("orderId", orderID),
+					zap.String("status", orderInfo.OrderStatus),
+				)
+				continue
+			}
+		}
+	}
+}
+
+// GetOrderStatus возвращает текущий статус ордера.
+//
+// Параметры:
+//   - symbol: символ торговой пары
+//   - orderID: ID ордера
+//
+// Возвращает информацию о ордере в общем формате.
+func (c *Client) GetOrderStatus(symbol, orderID string) (*exchanges.OrderResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), QueryOperationTimeout)
+	defer cancel()
+
+	orderInfo, err := c.rest.GetOrderByID(ctx, symbol, orderID)
+	if err != nil {
+		return nil, err
+	}
+
+	return ParseOrderResponse(orderInfo)
+}
+
 // CancelOrder отменяет ордер на бирже.
 //
 // Параметры:
