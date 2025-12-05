@@ -137,7 +137,7 @@
   - Парсинг JSON ответов Bybit
   - `parseOrderbookMessage()`
   - `parseOrderResponse()`
-- [ ] Создать `internal/exchanges/bybit/websocket.go`:
+- [x] Создать `internal/exchanges/bybit/websocket.go`:
   - WebSocket клиент с автоматическим reconnect
   - Типы: `WebSocketClient`, поля: conn, url, subscriptions, callback, reconnectCh, closeCh
   - Методы:
