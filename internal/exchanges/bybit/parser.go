@@ -83,11 +83,12 @@ func DetectMessageType(data []byte) MessageType {
 }
 
 // =============================================================================
-// Парсинг Orderbook
+// Парсинг Orderbook (с пулом объектов)
 // =============================================================================
 
-// ParseOrderbookMessage парсит сообщение стакана из WebSocket.
-// Возвращает PriceUpdate с заполненным стаканом и лучшими ценами.
+// ParseOrderbookMessagePooled парсит сообщение стакана с использованием пула объектов.
+// Возвращает PriceUpdate из пула — вызывающий код ДОЛЖЕН вернуть его через
+// exchanges.PutPriceUpdateWithOrderBook() после использования.
 //
 // Формат входных данных:
 //
@@ -103,6 +104,58 @@ func DetectMessageType(data []byte) MessageType {
 //	    "seq": 789
 //	  }
 //	}
+func ParseOrderbookMessagePooled(data []byte) (*exchanges.PriceUpdate, error) {
+	var msg WsOrderbookMessage
+	if err := jsonFast.Unmarshal(data, &msg); err != nil {
+		return nil, fmt.Errorf("failed to parse orderbook message: %w", err)
+	}
+
+	// Получаем объекты из пула
+	update := exchanges.GetPriceUpdate()
+	orderbook := exchanges.GetOrderBook()
+
+	// Парсим уровни стакана напрямую в слайсы из пула
+	if err := parseLevelsInto(msg.Data.Bids, &orderbook.Bids); err != nil {
+		// Возвращаем объекты в пул при ошибке
+		exchanges.PutOrderBook(orderbook)
+		exchanges.PutPriceUpdate(update)
+		return nil, fmt.Errorf("failed to parse bids: %w", err)
+	}
+
+	if err := parseLevelsInto(msg.Data.Asks, &orderbook.Asks); err != nil {
+		exchanges.PutOrderBook(orderbook)
+		exchanges.PutPriceUpdate(update)
+		return nil, fmt.Errorf("failed to parse asks: %w", err)
+	}
+
+	orderbook.UpdateID = msg.Data.UpdateID
+
+	// Извлекаем лучшие цены
+	var bestBid, bestAsk, bidQty, askQty float64
+	if len(orderbook.Bids) > 0 {
+		bestBid = orderbook.Bids[0].Price
+		bidQty = orderbook.Bids[0].Quantity
+	}
+	if len(orderbook.Asks) > 0 {
+		bestAsk = orderbook.Asks[0].Price
+		askQty = orderbook.Asks[0].Quantity
+	}
+
+	// Заполняем PriceUpdate
+	update.Exchange = ExchangeName
+	update.Symbol = msg.Data.Symbol
+	update.BestBid = bestBid
+	update.BestAsk = bestAsk
+	update.BidQty = bidQty
+	update.AskQty = askQty
+	update.Orderbook = orderbook
+	update.Timestamp = time.UnixMilli(msg.Timestamp)
+
+	return update, nil
+}
+
+// ParseOrderbookMessage парсит сообщение стакана из WebSocket.
+// DEPRECATED: Используйте ParseOrderbookMessagePooled для лучшей производительности.
 func ParseOrderbookMessage(data []byte) (*exchanges.PriceUpdate, error) {
 	var msg WsOrderbookMessage
 	if err := jsonFast.Unmarshal(data, &msg); err != nil {
@@ -147,6 +200,48 @@ func ParseOrderbookMessage(data []byte) (*exchanges.PriceUpdate, error) {
 	}, nil
 }
 
+// parseLevelsInto преобразует уровни стакана напрямую в существующий слайс.
+// Оптимизировано для минимизации аллокаций.
+func parseLevelsInto(levels [][]string, target *[]exchanges.Level) error {
+	if len(levels) == 0 {
+		return nil
+	}
+
+	// Убеждаемся, что target имеет достаточную capacity
+	// Это избегает переаллокации при append
+	if cap(*target) < len(levels) {
+		*target = make([]exchanges.Level, 0, len(levels))
+	}
+
+	for _, level := range levels {
+		if len(level) < 2 {
+			continue // Пропускаем некорректные уровни
+		}
+
+		price, err := ParseFloat(level[0])
+		if err != nil {
+			return fmt.Errorf("invalid price %q: %w", level[0], err)
+		}
+
+		qty, err := ParseFloat(level[1])
+		if err != nil {
+			return fmt.Errorf("invalid quantity %q: %w", level[1], err)
+		}
+
+		// Пропускаем уровни с нулевым объёмом (удалённые в delta)
+		if qty == 0 {
+			continue
+		}
+
+		*target = append(*target, exchanges.Level{
+			Price:    price,
+			Quantity: qty,
+		})
+	}
+
+	return nil
+}
+
 // parseLevels преобразует уровни стакана из формата Bybit [[price, qty], ...]
 // в слайс exchanges.Level.
 func parseLevels(levels [][]string) ([]exchanges.Level, error) {
@@ -187,14 +282,42 @@ func parseLevels(levels [][]string) ([]exchanges.Level, error) {
 }
 
 // =============================================================================
-// Парсинг Ticker
+// Парсинг Ticker (с пулом объектов)
 // =============================================================================
 
+// ParseTickerMessagePooled парсит сообщение тикера с использованием пула объектов.
+// Возвращает PriceUpdate из пула — вызывающий код ДОЛЖЕН вернуть его через
+// exchanges.PutPriceUpdate() после использования.
+func ParseTickerMessagePooled(data []byte) (*exchanges.PriceUpdate, error) {
+	var msg WsTickerMessage
+	if err := jsonFast.Unmarshal(data, &msg); err != nil {
+		return nil, fmt.Errorf("failed to parse ticker message: %w", err)
+	}
+
+	// Получаем объект из пула
+	update := exchanges.GetPriceUpdate()
+
+	// Парсим цены
+	bestBid, _ := ParseFloat(msg.Data.Bid1Price)
+	bestAsk, _ := ParseFloat(msg.Data.Ask1Price)
+	bidQty, _ := ParseFloat(msg.Data.Bid1Size)
+	askQty, _ := ParseFloat(msg.Data.Ask1Size)
+
+	// Заполняем PriceUpdate
+	update.Exchange = ExchangeName
+	update.Symbol = msg.Data.Symbol
+	update.BestBid = bestBid
+	update.BestAsk = bestAsk
+	update.BidQty = bidQty
+	update.AskQty = askQty
+	update.Orderbook = nil // Тикер не содержит полный стакан
+	update.Timestamp = time.UnixMilli(msg.Timestamp)
+
+	return update, nil
+}
+
 // ParseTickerMessage парсит сообщение тикера из WebSocket.
-// Возвращает PriceUpdate с лучшими ценами bid/ask.
-//
-// Используется как альтернатива orderbook для получения лучших цен
-// с минимальной нагрузкой на парсинг.
+// DEPRECATED: Используйте ParseTickerMessagePooled для лучшей производительности.
 func ParseTickerMessage(data []byte) (*exchanges.PriceUpdate, error) {
 	var msg WsTickerMessage
 	if err := jsonFast.Unmarshal(data, &msg); err != nil {
@@ -283,7 +406,7 @@ func ParsePlaceOrderResult(result *PlaceOrderResult, req *PlaceOrderRequest) *ex
 // Парсинг позиций
 // =============================================================================
 
-// ParsePositionInfo преобразует PositionInfo от Bybit в данные для мониторинга.
+// ParsedPosition содержит распарсенные данные позиции для мониторинга.
 type ParsedPosition struct {
 	Symbol        string
 	Side          exchanges.PositionSide

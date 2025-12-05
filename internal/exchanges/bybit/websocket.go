@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"arbitrage-terminal/internal/exchanges"
+	"arbitrage-terminal/pkg/metrics"
 
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
@@ -54,26 +56,32 @@ const (
 
 // WebSocketClient реализует WebSocket соединение с Bybit.
 // Поддерживает автоматический reconnect, ping/pong и управление подписками.
+//
+// Потокобезопасность:
+//   - callback защищён через atomic.Value
+//   - subscriptions защищены через sync.RWMutex
+//   - conn защищён через sync.RWMutex
 type WebSocketClient struct {
-	url           string                              // URL WebSocket сервера
-	conn          *websocket.Conn                     // Активное соединение
-	subscriptions map[string]bool                     // Активные подписки (topic -> subscribed)
-	callback      func(*exchanges.PriceUpdate)        // Callback для обновлений цен
-	errorCallback func(error)                         // Callback для критических ошибок
-	logger        *zap.Logger                         // Логгер
+	url           string                // URL WebSocket сервера
+	conn          *websocket.Conn       // Активное соединение
+	subscriptions map[string]bool       // Активные подписки (topic -> subscribed)
+	logger        *zap.Logger           // Логгер
 
 	// Каналы управления
-	closeCh     chan struct{} // Сигнал закрытия
-	reconnectCh chan struct{} // Сигнал переподключения
-	writeCh     chan []byte   // Канал для записи сообщений
+	closeCh   chan struct{} // Сигнал закрытия
+	stopLoopCh chan struct{} // Сигнал остановки текущих горутин при reconnect
+
+	// Callbacks (atomic для потокобезопасности)
+	callback      atomic.Value // func(*exchanges.PriceUpdate)
+	errorCallback atomic.Value // func(error)
 
 	// Состояние
 	connected  atomic.Bool // Флаг подключения
 	shouldStop atomic.Bool // Флаг остановки
 
 	// Синхронизация
-	mu       sync.RWMutex // Защита subscriptions и conn
-	writeMu  sync.Mutex   // Защита записи в WebSocket
+	mu       sync.RWMutex   // Защита subscriptions и conn
+	writeMu  sync.Mutex     // Защита записи в WebSocket
 	wg       sync.WaitGroup // Ожидание завершения горутин
 }
 
@@ -101,16 +109,21 @@ func NewWebSocketClient(cfg WebSocketConfig) (*WebSocketClient, error) {
 		logger = zap.NewNop()
 	}
 
-	return &WebSocketClient{
+	ws := &WebSocketClient{
 		url:           url,
 		subscriptions: make(map[string]bool),
-		callback:      cfg.Callback,
-		errorCallback: cfg.ErrorCallback,
 		logger:        logger,
 		closeCh:       make(chan struct{}),
-		reconnectCh:   make(chan struct{}, 1),
-		writeCh:       make(chan []byte, 100),
-	}, nil
+		stopLoopCh:    make(chan struct{}),
+	}
+
+	// Устанавливаем callbacks через atomic
+	ws.callback.Store(cfg.Callback)
+	if cfg.ErrorCallback != nil {
+		ws.errorCallback.Store(cfg.ErrorCallback)
+	}
+
+	return ws, nil
 }
 
 // =============================================================================
@@ -128,8 +141,8 @@ func (ws *WebSocketClient) Connect() error {
 
 	// Настройка dialer
 	dialer := websocket.Dialer{
-		ReadBufferSize:  ReadBufferSize,
-		WriteBufferSize: WriteBufferSize,
+		ReadBufferSize:   ReadBufferSize,
+		WriteBufferSize:  WriteBufferSize,
 		HandshakeTimeout: 10 * time.Second,
 	}
 
@@ -147,24 +160,33 @@ func (ws *WebSocketClient) Connect() error {
 	ws.connected.Store(true)
 	ws.shouldStop.Store(false)
 
+	// Пересоздаём канал остановки для новых горутин
+	ws.stopLoopCh = make(chan struct{})
+
 	ws.logger.Info("WebSocket connected",
 		zap.String("url", ws.url),
 	)
 
+	// Обновляем метрику подключения
+	metrics.SetWebSocketConnected(ExchangeName, true)
+
 	// Запуск горутин обработки
-	ws.wg.Add(3)
-	go ws.handleMessages()
-	go ws.handlePing()
-	go ws.handleReconnect()
+	ws.wg.Add(2)
+	go ws.runMessageLoop()
+	go ws.runPingLoop()
 
 	return nil
 }
 
 // Close закрывает WebSocket соединение.
 func (ws *WebSocketClient) Close() error {
+	// Проверяем, не закрыты ли мы уже
+	if ws.shouldStop.Load() {
+		return nil
+	}
 	ws.shouldStop.Store(true)
 
-	// Сигнал закрытия
+	// Сигнал закрытия всем горутинам
 	close(ws.closeCh)
 
 	// Закрываем соединение
@@ -176,8 +198,22 @@ func (ws *WebSocketClient) Close() error {
 	ws.connected.Store(false)
 	ws.mu.Unlock()
 
-	// Ждём завершения горутин
-	ws.wg.Wait()
+	// Обновляем метрику подключения
+	metrics.SetWebSocketConnected(ExchangeName, false)
+
+	// Ждём завершения горутин с таймаутом
+	done := make(chan struct{})
+	go func() {
+		ws.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Горутины завершились нормально
+	case <-time.After(5 * time.Second):
+		ws.logger.Warn("timeout waiting for goroutines to stop")
+	}
 
 	ws.logger.Info("WebSocket closed")
 	return nil
@@ -189,17 +225,29 @@ func (ws *WebSocketClient) IsConnected() bool {
 }
 
 // =============================================================================
-// Обработка сообщений
+// Горутины обработки с recover
 // =============================================================================
 
-// handleMessages читает и обрабатывает входящие сообщения.
-func (ws *WebSocketClient) handleMessages() {
+// runMessageLoop читает и обрабатывает входящие сообщения.
+// Горутина защищена от паники через recover.
+func (ws *WebSocketClient) runMessageLoop() {
 	defer ws.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			ws.logger.Error("panic in message loop",
+				zap.Any("panic", r),
+				zap.String("stack", string(debug.Stack())),
+			)
+			// Инициируем reconnect при панике
+			ws.handleConnectionError(fmt.Errorf("panic: %v", r))
+		}
+	}()
 
 	for {
-		// Проверка на закрытие
 		select {
 		case <-ws.closeCh:
+			return
+		case <-ws.stopLoopCh:
 			return
 		default:
 		}
@@ -214,6 +262,9 @@ func (ws *WebSocketClient) handleMessages() {
 			continue
 		}
 
+		// Устанавливаем deadline для чтения
+		conn.SetReadDeadline(time.Now().Add(PingInterval + PongTimeout))
+
 		// Читаем сообщение
 		_, message, err := conn.ReadMessage()
 		if err != nil {
@@ -225,8 +276,7 @@ func (ws *WebSocketClient) handleMessages() {
 				zap.Error(err),
 			)
 
-			ws.connected.Store(false)
-			ws.triggerReconnect()
+			ws.handleConnectionError(err)
 			return
 		}
 
@@ -235,68 +285,18 @@ func (ws *WebSocketClient) handleMessages() {
 	}
 }
 
-// processMessage обрабатывает одно входящее сообщение.
-func (ws *WebSocketClient) processMessage(data []byte) {
-	// Определяем тип сообщения
-	msgType := DetectMessageType(data)
-
-	switch msgType {
-	case MessageTypeOrderbook:
-		update, err := ParseOrderbookMessage(data)
-		if err != nil {
-			ws.logger.Warn("failed to parse orderbook",
-				zap.Error(err),
-			)
-			return
-		}
-
-		// Валидация
-		if err := ValidatePriceUpdate(update); err != nil {
-			ws.logger.Debug("invalid price update",
-				zap.Error(err),
-			)
-			return
-		}
-
-		// Callback
-		if ws.callback != nil {
-			ws.callback(update)
-		}
-
-	case MessageTypeTicker:
-		update, err := ParseTickerMessage(data)
-		if err != nil {
-			ws.logger.Warn("failed to parse ticker",
-				zap.Error(err),
-			)
-			return
-		}
-
-		if ws.callback != nil {
-			ws.callback(update)
-		}
-
-	case MessageTypePong:
-		ws.logger.Debug("pong received")
-
-	case MessageTypeSubscribe:
-		ws.logger.Debug("subscription confirmed")
-
-	default:
-		// Игнорируем неизвестные сообщения
-		ws.logger.Debug("unknown message type",
-			zap.ByteString("data", data[:min(len(data), 200)]),
-		)
-	}
-}
-
-// =============================================================================
-// Ping/Pong
-// =============================================================================
-
-// handlePing отправляет ping сообщения для поддержания соединения.
-func (ws *WebSocketClient) handlePing() {
+// runPingLoop отправляет ping сообщения для поддержания соединения.
+// Горутина защищена от паники через recover.
+func (ws *WebSocketClient) runPingLoop() {
 	defer ws.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			ws.logger.Error("panic in ping loop",
+				zap.Any("panic", r),
+				zap.String("stack", string(debug.Stack())),
+			)
+		}
+	}()
 
 	ticker := time.NewTicker(PingInterval)
 	defer ticker.Stop()
@@ -305,7 +305,8 @@ func (ws *WebSocketClient) handlePing() {
 		select {
 		case <-ws.closeCh:
 			return
-
+		case <-ws.stopLoopCh:
+			return
 		case <-ticker.C:
 			if !ws.connected.Load() {
 				continue
@@ -315,12 +316,108 @@ func (ws *WebSocketClient) handlePing() {
 				ws.logger.Warn("ping failed",
 					zap.Error(err),
 				)
-				ws.triggerReconnect()
-				return
+				// Не инициируем reconnect на ошибке ping,
+				// read error сделает это
 			}
 		}
 	}
 }
+
+// handleConnectionError обрабатывает ошибку соединения и запускает reconnect.
+func (ws *WebSocketClient) handleConnectionError(err error) {
+	ws.connected.Store(false)
+	metrics.SetWebSocketConnected(ExchangeName, false)
+
+	// Останавливаем текущие горутины
+	select {
+	case <-ws.stopLoopCh:
+		// Уже закрыт
+	default:
+		close(ws.stopLoopCh)
+	}
+
+	// Запускаем reconnect в отдельной горутине
+	go ws.reconnect()
+}
+
+// =============================================================================
+// Обработка сообщений (hot path)
+// =============================================================================
+
+// processMessage обрабатывает одно входящее сообщение.
+// Оптимизировано для минимальной латентности в hot path.
+func (ws *WebSocketClient) processMessage(data []byte) {
+	// Запускаем таймер для метрики парсинга
+	parseTimer := metrics.NewTimer()
+
+	// Определяем тип сообщения
+	msgType := DetectMessageType(data)
+
+	switch msgType {
+	case MessageTypeOrderbook:
+		// Используем пул для PriceUpdate
+		update, err := ParseOrderbookMessagePooled(data)
+		if err != nil {
+			ws.logger.Warn("failed to parse orderbook",
+				zap.Error(err),
+			)
+			return
+		}
+
+		// Записываем метрику парсинга
+		metrics.JSONParsingDuration.WithLabelValues(ExchangeName, "orderbook").Observe(parseTimer.ElapsedMs())
+
+		// Валидация
+		if err := ValidatePriceUpdate(update); err != nil {
+			// Возвращаем в пул при ошибке валидации
+			exchanges.PutPriceUpdateWithOrderBook(update)
+			return
+		}
+
+		// Метрика события
+		metrics.IncrementWebSocketEvent(ExchangeName, update.Symbol, "orderbook")
+
+		// Вызываем callback (потокобезопасно через atomic)
+		if cb := ws.callback.Load(); cb != nil {
+			cb.(func(*exchanges.PriceUpdate))(update)
+		}
+
+		// ВАЖНО: Не возвращаем update в пул здесь!
+		// Callback отвечает за возврат в пул после обработки
+
+	case MessageTypeTicker:
+		update, err := ParseTickerMessagePooled(data)
+		if err != nil {
+			ws.logger.Warn("failed to parse ticker",
+				zap.Error(err),
+			)
+			return
+		}
+
+		metrics.JSONParsingDuration.WithLabelValues(ExchangeName, "ticker").Observe(parseTimer.ElapsedMs())
+		metrics.IncrementWebSocketEvent(ExchangeName, update.Symbol, "ticker")
+
+		if cb := ws.callback.Load(); cb != nil {
+			cb.(func(*exchanges.PriceUpdate))(update)
+		}
+
+	case MessageTypePong:
+		metrics.IncrementWebSocketEvent(ExchangeName, "", "pong")
+
+	case MessageTypeSubscribe:
+		// Логируем только при debug уровне
+		if ws.logger.Core().Enabled(zap.DebugLevel) {
+			ws.logger.Debug("subscription confirmed")
+		}
+
+	default:
+		// Неизвестные сообщения игнорируем без логирования в hot path
+	}
+}
+
+// =============================================================================
+// Ping
+// =============================================================================
 
 // sendPing отправляет ping сообщение.
 func (ws *WebSocketClient) sendPing() error {
@@ -340,37 +437,18 @@ func (ws *WebSocketClient) sendPing() error {
 // Reconnect
 // =============================================================================
 
-// handleReconnect обрабатывает переподключение.
-func (ws *WebSocketClient) handleReconnect() {
-	defer ws.wg.Done()
-
-	for {
-		select {
-		case <-ws.closeCh:
-			return
-
-		case <-ws.reconnectCh:
-			if ws.shouldStop.Load() {
-				return
-			}
-
-			ws.logger.Info("starting reconnect sequence")
-			ws.reconnect()
-		}
-	}
-}
-
-// triggerReconnect инициирует переподключение.
-func (ws *WebSocketClient) triggerReconnect() {
-	select {
-	case ws.reconnectCh <- struct{}{}:
-	default:
-		// Reconnect уже запланирован
-	}
-}
-
 // reconnect выполняет переподключение с exponential backoff.
+// Защищено от паники через recover.
 func (ws *WebSocketClient) reconnect() {
+	defer func() {
+		if r := recover(); r != nil {
+			ws.logger.Error("panic in reconnect",
+				zap.Any("panic", r),
+				zap.String("stack", string(debug.Stack())),
+			)
+		}
+	}()
+
 	backoff := InitialReconnectDelay
 
 	for attempt := 1; attempt <= MaxReconnectAttempts; attempt++ {
@@ -383,7 +461,7 @@ func (ws *WebSocketClient) reconnect() {
 			zap.Duration("backoff", backoff),
 		)
 
-		// Ждём перед попыткой
+		// Ждём перед попыткой (с возможностью прерывания)
 		select {
 		case <-ws.closeCh:
 			return
@@ -400,8 +478,8 @@ func (ws *WebSocketClient) reconnect() {
 
 		// Пытаемся подключиться
 		dialer := websocket.Dialer{
-			ReadBufferSize:  ReadBufferSize,
-			WriteBufferSize: WriteBufferSize,
+			ReadBufferSize:   ReadBufferSize,
+			WriteBufferSize:  WriteBufferSize,
 			HandshakeTimeout: 10 * time.Second,
 		}
 
@@ -411,6 +489,8 @@ func (ws *WebSocketClient) reconnect() {
 				zap.Int("attempt", attempt),
 				zap.Error(err),
 			)
+
+			metrics.IncrementReconnect(ExchangeName, false)
 
 			// Exponential backoff
 			backoff *= 2
@@ -423,6 +503,7 @@ func (ws *WebSocketClient) reconnect() {
 		// Успешное подключение
 		ws.mu.Lock()
 		ws.conn = conn
+		ws.stopLoopCh = make(chan struct{}) // Новый канал для новых горутин
 		ws.connected.Store(true)
 		ws.mu.Unlock()
 
@@ -430,12 +511,16 @@ func (ws *WebSocketClient) reconnect() {
 			zap.Int("attempt", attempt),
 		)
 
+		metrics.IncrementReconnect(ExchangeName, true)
+		metrics.SetWebSocketConnected(ExchangeName, true)
+
 		// Восстанавливаем подписки
 		ws.resubscribe()
 
-		// Перезапускаем обработчик сообщений
-		ws.wg.Add(1)
-		go ws.handleMessages()
+		// Перезапускаем горутины обработки
+		ws.wg.Add(2)
+		go ws.runMessageLoop()
+		go ws.runPingLoop()
 
 		return
 	}
@@ -445,9 +530,9 @@ func (ws *WebSocketClient) reconnect() {
 		zap.Int("maxAttempts", MaxReconnectAttempts),
 	)
 
-	// Уведомляем об ошибке
-	if ws.errorCallback != nil {
-		ws.errorCallback(fmt.Errorf("websocket reconnect failed after %d attempts", MaxReconnectAttempts))
+	// Уведомляем об ошибке через callback
+	if cb := ws.errorCallback.Load(); cb != nil {
+		cb.(func(error))(fmt.Errorf("websocket reconnect failed after %d attempts", MaxReconnectAttempts))
 	}
 }
 
@@ -634,13 +719,19 @@ func (ws *WebSocketClient) writeMessage(data []byte) error {
 }
 
 // SetCallback устанавливает callback для обновлений цен.
+// Потокобезопасен.
 func (ws *WebSocketClient) SetCallback(callback func(*exchanges.PriceUpdate)) {
-	ws.callback = callback
+	if callback != nil {
+		ws.callback.Store(callback)
+	}
 }
 
 // SetErrorCallback устанавливает callback для критических ошибок.
+// Потокобезопасен.
 func (ws *WebSocketClient) SetErrorCallback(callback func(error)) {
-	ws.errorCallback = callback
+	if callback != nil {
+		ws.errorCallback.Store(callback)
+	}
 }
 
 // SetLogger устанавливает логгер.
