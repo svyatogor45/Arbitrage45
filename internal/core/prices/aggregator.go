@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"arbitrage-terminal/internal/exchanges"
+	"go.uber.org/zap"
 )
 
 // PriceUpdateCallback вызывается при каждом обновлении цены.
@@ -18,6 +19,7 @@ type Aggregator struct {
 	trackers     map[string]*Tracker          // symbol -> Tracker
 	exchanges    map[string]exchanges.Exchange // exchange name -> Exchange client
 	callback     PriceUpdateCallback          // Callback для отправки событий в Coordinator
+	logger       *zap.Logger                  // Логгер для записи событий
 	mu           sync.RWMutex                 // Защита trackers
 	closeCh      chan struct{}                // Канал для graceful shutdown
 	closeOnce    sync.Once                    // Защита от повторного close(closeCh)
@@ -27,16 +29,24 @@ type Aggregator struct {
 // NewAggregator создаёт новый Aggregator.
 //
 // Параметры:
-//   - exchanges: карта коннекторов бирж (name -> Exchange)
+//   - exchs: карта коннекторов бирж (name -> Exchange)
 //   - callback: функция-обработчик обновлений цен (отправка в Coordinator)
+//   - logger: логгер zap для записи событий
 func NewAggregator(
-	exchanges map[string]exchanges.Exchange,
+	exchs map[string]exchanges.Exchange,
 	callback PriceUpdateCallback,
+	logger *zap.Logger,
 ) *Aggregator {
+	// Если логгер не передан, используем no-op логгер
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+
 	return &Aggregator{
 		trackers:  make(map[string]*Tracker),
-		exchanges: exchanges,
+		exchanges: exchs,
 		callback:  callback,
+		logger:    logger,
 		closeCh:   make(chan struct{}),
 	}
 }
@@ -154,23 +164,33 @@ func (a *Aggregator) GetAllSymbols() []string {
 // Start запускает Aggregator.
 // Подключает все биржи через WebSocket и начинает получать обновления.
 func (a *Aggregator) Start() error {
+	a.logger.Info("Запуск Aggregator", zap.Int("exchanges_count", len(a.exchanges)))
+
 	// Подключиться ко всем биржам
 	for name, exch := range a.exchanges {
 		if err := exch.Connect(); err != nil {
+			a.logger.Error("Не удалось подключиться к бирже",
+				zap.String("exchange", name),
+				zap.Error(err),
+			)
 			return fmt.Errorf("failed to connect to exchange %s: %w", name, err)
 		}
+		a.logger.Info("Подключение к бирже установлено", zap.String("exchange", name))
 	}
 
 	// Запустить мониторинг устаревших данных
 	a.wg.Add(1)
 	go a.monitorStaleData()
 
+	a.logger.Info("Aggregator успешно запущен")
 	return nil
 }
 
 // Stop останавливает Aggregator и закрывает все соединения.
 // Безопасен для многократного вызова благодаря sync.Once.
 func (a *Aggregator) Stop() error {
+	a.logger.Info("Остановка Aggregator...")
+
 	// Защита от повторного закрытия канала (паника)
 	a.closeOnce.Do(func() {
 		close(a.closeCh)
@@ -182,10 +202,16 @@ func (a *Aggregator) Stop() error {
 	// Отключиться от всех бирж
 	for name, exch := range a.exchanges {
 		if err := exch.Close(); err != nil {
+			a.logger.Error("Не удалось отключиться от биржи",
+				zap.String("exchange", name),
+				zap.Error(err),
+			)
 			return fmt.Errorf("failed to close exchange %s: %w", name, err)
 		}
+		a.logger.Info("Отключение от биржи выполнено", zap.String("exchange", name))
 	}
 
+	a.logger.Info("Aggregator остановлен")
 	return nil
 }
 
@@ -222,8 +248,11 @@ func (a *Aggregator) checkStaleData() {
 	for _, tracker := range trackers {
 		for _, exchName := range tracker.GetExchanges() {
 			if tracker.IsStale(exchName, maxAge) {
-				// ПРИМЕЧАНИЕ: Здесь должно быть логирование
-				// log.Warn("Stale data detected", "symbol", tracker.GetSymbol(), "exchange", exchName)
+				a.logger.Warn("Обнаружены устаревшие данные",
+					zap.String("symbol", tracker.GetSymbol()),
+					zap.String("exchange", exchName),
+					zap.Duration("max_age", maxAge),
+				)
 
 				// TODO: Можно попытаться переподключиться к WebSocket
 			}
