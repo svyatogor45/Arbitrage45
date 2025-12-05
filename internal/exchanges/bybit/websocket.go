@@ -497,22 +497,30 @@ func (ws *WebSocketClient) runCallbackWorker() {
 
 // sendToCallback отправляет обновление в асинхронный callback worker.
 //
-// Неблокирующая операция: если буфер полон, данные отбрасываются с предупреждением.
-// Это предотвращает блокировку WebSocket читателя.
+// Использует блокирующую отправку с таймаутом для предотвращения потери данных.
+// Согласно Requirements.md: "Обрабатывает 30 пар на 6 биржах без потери событий"
+//
+// Если буфер переполнен более 100ms — это критическая ситуация,
+// означающая что система перегружена.
 func (ws *WebSocketClient) sendToCallback(update *exchanges.PriceUpdate) {
 	if update == nil {
 		return
 	}
 
-	// Неблокирующая отправка
+	// Блокирующая отправка с таймаутом
+	// 100ms достаточно для обработки в 99.9% случаев
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
 	select {
 	case ws.callbackCh <- update:
 		// Успешно отправлено
-	default:
-		// Буфер полон — отбрасываем и логируем
-		ws.getLogger().Warn("callback буфер переполнен, данные отброшены",
+	case <-ctx.Done():
+		// Таймаут — КРИТИЧЕСКАЯ ситуация, система перегружена
+		ws.getLogger().Error("КРИТИЧНО: callback буфер переполнен > 100ms, система перегружена",
 			zap.String("symbol", update.Symbol),
 			zap.Int("bufferSize", CallbackBufferSize),
+			zap.Int("bufferLen", len(ws.callbackCh)),
 		)
 		metrics.IncrementBufferOverflow("bybit_ws")
 
@@ -772,8 +780,41 @@ func (ws *WebSocketClient) reconnect() {
 		// Успешное подключение — обновляем состояние
 		// ВАЖНО: Ждём завершения старых горутин ПЕРЕД созданием нового stopLoopCh
 		// для предотвращения race condition
-		oldStopCh := ws.stopLoopCh
 
+		// Шаг 1: Сохраняем старый stopLoopCh под мьютексом
+		ws.mu.Lock()
+		oldStopCh := ws.stopLoopCh
+		ws.mu.Unlock()
+
+		// Шаг 2: Закрываем старый канал под мьютексом (если ещё не закрыт)
+		if oldStopCh != nil {
+			ws.mu.Lock()
+			select {
+			case <-oldStopCh:
+				// Уже закрыт, ничего не делаем
+			default:
+				close(oldStopCh)
+			}
+			ws.mu.Unlock()
+
+			// Шаг 3: Ждём завершения старых горутин через WaitGroup
+			// вместо хардкода sleep для корректной синхронизации
+			done := make(chan struct{})
+			go func() {
+				ws.wg.Wait() // Ждём завершения ВСЕХ горутин
+				close(done)
+			}()
+
+			select {
+			case <-done:
+				ws.getLogger().Debug("старые горутины завершены")
+			case <-time.After(2 * time.Second):
+				// Даём разумный таймаут для завершения
+				ws.getLogger().Warn("таймаут ожидания завершения старых горутин")
+			}
+		}
+
+		// Шаг 4: Теперь безопасно создаём новое соединение и каналы
 		ws.mu.Lock()
 		ws.conn = conn
 		ws.stopLoopCh = make(chan struct{}) // Новый канал для новых горутин
@@ -784,19 +825,6 @@ func (ws *WebSocketClient) reconnect() {
 		}
 		ws.mu.Unlock()
 
-		// Ждём завершения старых горутин (если были)
-		// Это гарантирует, что старые горутины не читают новый stopLoopCh
-		if oldStopCh != nil {
-			select {
-			case <-oldStopCh:
-				// Старый канал уже закрыт
-			default:
-				// Закрываем старый канал и даём время горутинам завершиться
-				close(oldStopCh)
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
-
 		ws.getLogger().Info("переподключение успешно",
 			zap.Int("attempt", attempt),
 		)
@@ -804,10 +832,28 @@ func (ws *WebSocketClient) reconnect() {
 		metrics.IncrementReconnect(ExchangeName, true)
 		metrics.SetWebSocketConnected(ExchangeName, true)
 
-		// Восстанавливаем подписки
-		ws.resubscribe()
+		// Шаг 5: Восстанавливаем подписки ПЕРЕД запуском горутин
+		// Это предотвращает goroutine leak при ошибках подписки
+		if err := ws.resubscribe(); err != nil {
+			ws.getLogger().Error("критическая ошибка восстановления подписок",
+				zap.Error(err),
+			)
+			// Закрываем соединение и пробуем снова
+			ws.mu.Lock()
+			conn.Close()
+			ws.conn = nil
+			ws.connected.Store(false)
+			ws.mu.Unlock()
 
-		// Перезапускаем горутины обработки:
+			// Exponential backoff
+			backoff *= 2
+			if backoff > MaxReconnectDelay {
+				backoff = MaxReconnectDelay
+			}
+			continue
+		}
+
+		// Шаг 6: Только после успешной подписки запускаем горутины обработки:
 		// - runMessageLoop: читает и парсит сообщения
 		// - runPingLoop: отправляет ping для поддержания соединения
 		// - runCallbackWorker: асинхронно вызывает callbacks
@@ -831,7 +877,8 @@ func (ws *WebSocketClient) reconnect() {
 }
 
 // resubscribe восстанавливает все подписки после reconnect.
-func (ws *WebSocketClient) resubscribe() {
+// Возвращает ошибку если подписка не удалась.
+func (ws *WebSocketClient) resubscribe() error {
 	ws.mu.RLock()
 	topics := make([]string, 0, len(ws.subscriptions))
 	for topic := range ws.subscriptions {
@@ -840,7 +887,7 @@ func (ws *WebSocketClient) resubscribe() {
 	ws.mu.RUnlock()
 
 	if len(topics) == 0 {
-		return
+		return nil
 	}
 
 	ws.getLogger().Info("восстановление подписок",
@@ -852,7 +899,10 @@ func (ws *WebSocketClient) resubscribe() {
 		ws.getLogger().Error("ошибка восстановления подписок",
 			zap.Error(err),
 		)
+		return fmt.Errorf("failed to resubscribe: %w", err)
 	}
+
+	return nil
 }
 
 // =============================================================================

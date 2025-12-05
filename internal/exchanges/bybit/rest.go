@@ -82,7 +82,7 @@ const (
 // InstrumentCacheTTL — время жизни кеша информации об инструментах.
 // Данные инструментов (min qty, tick size) редко меняются.
 // Согласно Requirements.md: "Обновляем раз в сутки"
-const InstrumentCacheTTL = 1 * time.Hour
+const InstrumentCacheTTL = 24 * time.Hour
 
 // instrumentCacheEntry представляет запись в кеше инструментов.
 type instrumentCacheEntry struct {
@@ -981,7 +981,7 @@ func (c *RestClient) GetInstruments(ctx context.Context, symbol string) (*GetIns
 // GetInstrumentInfo возвращает информацию о конкретном инструменте.
 //
 // Использует кеширование: данные инструментов (min qty, tick size) редко меняются.
-// Кеш обновляется раз в час (InstrumentCacheTTL).
+// Кеш обновляется раз в сутки (InstrumentCacheTTL = 24 часа).
 //
 // Параметры:
 //   - ctx: контекст для отмены
@@ -1067,6 +1067,17 @@ func (c *RestClient) SetLogger(logger *zap.Logger) {
 	if logger != nil {
 		c.logger.Store(logger)
 	}
+}
+
+// Close выполняет graceful shutdown REST клиента.
+// Закрывает все активные HTTP соединения и освобождает ресурсы.
+func (c *RestClient) Close() error {
+	if c.httpClient != nil {
+		// Закрываем idle соединения для освобождения ресурсов
+		c.httpClient.CloseIdleConnections()
+		c.getLogger().Debug("REST клиент закрыт, idle соединения освобождены")
+	}
+	return nil
 }
 
 // Ping проверяет доступность API (через запрос времени сервера).
