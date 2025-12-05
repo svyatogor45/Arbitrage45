@@ -329,12 +329,14 @@ func (r *Repository) SetLeverage(exchange, symbol string, leverage int) error {
 // CleanOldLeverageCache удаляет записи старше заданного времени.
 // Полезно для периодической очистки устаревших данных.
 func (r *Repository) CleanOldLeverageCache(olderThan time.Duration) error {
+	// Используем секунды для корректного формата PostgreSQL interval
+	// PostgreSQL понимает INTERVAL '1 second' * N, но не Go формат "Nh0m0s"
 	query := `
 		DELETE FROM leverage_cache
-		WHERE updated_at < NOW() - $1::interval
+		WHERE updated_at < NOW() - INTERVAL '1 second' * $1
 	`
 
-	_, err := r.db.Exec(query, olderThan.String())
+	_, err := r.db.Exec(query, int64(olderThan.Seconds()))
 	if err != nil {
 		return fmt.Errorf("не удалось очистить старый кэш плеча: %w", err)
 	}

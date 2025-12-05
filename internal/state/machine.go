@@ -37,9 +37,10 @@ const (
 // Machine управляет состояниями торговой пары.
 // Потокобезопасен (thread-safe).
 type Machine struct {
-	current    State        // Текущее состояние
-	mu         sync.RWMutex // Защита current
-	shutdownCh chan struct{} // Канал для graceful shutdown
+	current      State         // Текущее состояние
+	mu           sync.RWMutex  // Защита current
+	shutdownCh   chan struct{} // Канал для graceful shutdown
+	shutdownOnce sync.Once     // Защита от повторного вызова Shutdown()
 }
 
 // NewMachine создаёт новую State Machine с начальным состоянием PAUSED.
@@ -150,8 +151,11 @@ func (m *Machine) ShutdownCh() <-chan struct{} {
 }
 
 // Shutdown сигнализирует о завершении работы.
+// Безопасен для вызова несколько раз (защита через sync.Once).
 func (m *Machine) Shutdown() {
-	close(m.shutdownCh)
+	m.shutdownOnce.Do(func() {
+		close(m.shutdownCh)
+	})
 }
 
 // String возвращает строковое представление текущего состояния.

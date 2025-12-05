@@ -188,3 +188,85 @@ func IsRetryableError(err error) bool {
 	}
 	return false
 }
+
+// SymbolFormat определяет формат символа для каждой биржи.
+// Разные биржи используют разные разделители и суффиксы.
+type SymbolFormat struct {
+	Separator string // Разделитель между base и quote (например, "-", "_", "")
+	Suffix    string // Суффикс для контрактов (например, "-SWAP" для OKX)
+}
+
+// exchangeSymbolFormats содержит форматы символов для каждой биржи.
+var exchangeSymbolFormats = map[string]SymbolFormat{
+	"bybit":  {Separator: "", Suffix: ""},        // BTCUSDT
+	"bitget": {Separator: "", Suffix: ""},        // BTCUSDT
+	"bingx":  {Separator: "-", Suffix: ""},       // BTC-USDT
+	"gate":   {Separator: "_", Suffix: ""},       // BTC_USDT
+	"okx":    {Separator: "-", Suffix: "-SWAP"},  // BTC-USDT-SWAP
+	"htx":    {Separator: "-", Suffix: ""},       // BTC-USDT
+	"mexc":   {Separator: "_", Suffix: ""},       // BTC_USDT
+}
+
+// NormalizeSymbol преобразует символ в унифицированный формат (BTCUSDT).
+// Используется для хранения и сравнения символов.
+func NormalizeSymbol(symbol string) string {
+	// Удалить известные суффиксы
+	for _, suffix := range []string{"-SWAP", "_SWAP", "-PERP", "_PERP"} {
+		if len(symbol) > len(suffix) && symbol[len(symbol)-len(suffix):] == suffix {
+			symbol = symbol[:len(symbol)-len(suffix)]
+		}
+	}
+
+	// Заменить разделители на пустую строку
+	result := ""
+	for _, r := range symbol {
+		if r != '-' && r != '_' {
+			result += string(r)
+		}
+	}
+
+	return result
+}
+
+// FormatSymbolForExchange преобразует унифицированный символ (BTCUSDT) в формат биржи.
+// Параметры:
+//   - symbol: унифицированный символ (например, "BTCUSDT")
+//   - exchange: название биржи (например, "okx")
+//
+// Возвращает символ в формате биржи (например, "BTC-USDT-SWAP" для OKX).
+func FormatSymbolForExchange(symbol, exchange string) string {
+	format, exists := exchangeSymbolFormats[exchange]
+	if !exists {
+		// По умолчанию возвращаем как есть
+		return symbol
+	}
+
+	// Если разделитель пустой и нет суффикса - возвращаем как есть
+	if format.Separator == "" && format.Suffix == "" {
+		return symbol
+	}
+
+	// Извлечь base и quote из унифицированного символа
+	// Предполагаем формат типа BTCUSDT, ETHUSDT и т.д.
+	base, quote := extractBaseQuote(symbol)
+	if base == "" || quote == "" {
+		return symbol // Не удалось разобрать, возвращаем как есть
+	}
+
+	return base + format.Separator + quote + format.Suffix
+}
+
+// extractBaseQuote извлекает базовую и котируемую валюту из символа.
+// Поддерживает стандартные котируемые валюты: USDT, USD, BUSD, USDC.
+func extractBaseQuote(symbol string) (base, quote string) {
+	// Известные котируемые валюты (в порядке приоритета проверки)
+	quotes := []string{"USDT", "BUSD", "USDC", "USD"}
+
+	for _, q := range quotes {
+		if len(symbol) > len(q) && symbol[len(symbol)-len(q):] == q {
+			return symbol[:len(symbol)-len(q)], q
+		}
+	}
+
+	return "", ""
+}

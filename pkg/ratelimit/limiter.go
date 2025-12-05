@@ -87,7 +87,7 @@ func (l *Limiter) Wait(ctx context.Context) error {
 		l.mu.Unlock()
 
 		// Спать минимум 1ms, максимум waitTime
-		sleepTime := minDuration(waitTime, 100*time.Millisecond)
+		sleepTime := min(waitTime, 100*time.Millisecond)
 		if sleepTime < 1*time.Millisecond {
 			sleepTime = 1 * time.Millisecond
 		}
@@ -183,18 +183,5 @@ func (l *Limiter) String() string {
 	)
 }
 
-// min возвращает минимум из двух float64
-func min(a, b float64) float64 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// minDuration возвращает минимум из двух time.Duration
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
-}
+// Примечание: используется встроенная функция min() из Go 1.21+
+// для float64 и time.Duration

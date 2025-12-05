@@ -23,8 +23,9 @@ type BestPrices struct {
 	CheapestAsk      float64   // Самая дешёвая цена покупки
 	DearestExchange  string    // Биржа с самым дорогим bid (для short)
 	DearestBid       float64   // Самая дорогая цена продажи
-	NetSpread        float64   // Чистый спред с учётом комиссий
-	RawSpread        float64   // Сырой спред без комиссий
+	NetSpread        float64   // Чистый спред с учётом комиссий (в %)
+	RawSpread        float64   // Сырой спред без комиссий (в %)
+	AbsoluteSpread   float64   // Абсолютный спред в USDT (dearestBid - cheapestAsk)
 	Timestamp        time.Time // Время расчёта
 }
 
@@ -99,28 +100,32 @@ func (t *Tracker) GetBestPrices() *BestPrices {
 		return nil
 	}
 
-	// Сырой спред (без комиссий)
-	rawSpread := dearestBid - cheapestAsk
+	// Защита от деления на ноль
+	if cheapestAsk == 0 {
+		return nil
+	}
 
-	// Чистый спред с учётом комиссий
-	// Формула: spread - 2 * (feeA + feeB) * avgPrice
-	// Где feeA = комиссия на long бирже, feeB = комиссия на short бирже
-	// avgPrice = средняя цена между cheapestAsk и dearestBid
+	// Абсолютный спред в USDT
+	absoluteSpread := dearestBid - cheapestAsk
+
+	// Сырой спред в процентах (без комиссий)
+	// Формула: ((dearestBid - cheapestAsk) / cheapestAsk) * 100
+	rawSpreadPercent := (absoluteSpread / cheapestAsk) * 100
+
+	// Чистый спред с учётом комиссий (в процентах)
+	// Формула из документации: Чистый спред = Спред (%) - 2 × (комиссия_биржа_A + комиссия_биржа_B)
+	// totalFeePercent уже содержит 2 × (feeA + feeB) в процентах
 	totalFeePercent := config.GetTotalFeePercent(cheapestExchange, dearestExchange)
-
-	// Рассчитать среднюю цену для корректного вычета комиссий
-	avgPrice := (cheapestAsk + dearestBid) / 2
-
-	// Вычитаем комиссии из спреда
-	netSpread := rawSpread - (avgPrice * totalFeePercent / 100)
+	netSpreadPercent := rawSpreadPercent - totalFeePercent
 
 	return &BestPrices{
 		CheapestExchange: cheapestExchange,
 		CheapestAsk:      cheapestAsk,
 		DearestExchange:  dearestExchange,
 		DearestBid:       dearestBid,
-		NetSpread:        netSpread,
-		RawSpread:        rawSpread,
+		NetSpread:        netSpreadPercent,
+		RawSpread:        rawSpreadPercent,
+		AbsoluteSpread:   absoluteSpread,
 		Timestamp:        time.Now(),
 	}
 }

@@ -94,6 +94,11 @@ func (a *Aggregator) Unsubscribe(symbol string) error {
 //  1. Обновить трекер для символа
 //  2. Вызвать callback для отправки события в Coordinator
 func (a *Aggregator) HandlePriceUpdate(update *exchanges.PriceUpdate) {
+	// Защита от nil - может возникнуть при ошибках WebSocket или очереди
+	if update == nil {
+		return
+	}
+
 	a.mu.RLock()
 	tracker, exists := a.trackers[update.Symbol]
 	a.mu.RUnlock()

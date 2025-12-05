@@ -6,6 +6,10 @@ import (
 	"arbitrage-terminal/internal/exchanges"
 )
 
+// MaxOrderbookLevels определяет максимальное количество уровней стакана для расчёта.
+// Согласно Requirements.md: "Для расчёта средней цены исполнения учитываем 10 уровней стакана."
+const MaxOrderbookLevels = 10
+
 // CalculateAvgPrice рассчитывает среднюю цену исполнения для заданного объёма.
 // Проходит по уровням стакана и вычисляет средневзвешенную цену.
 //
@@ -49,10 +53,15 @@ func CalculateAvgPrice(book *exchanges.OrderBook, volume float64, side exchanges
 		return 0, fmt.Errorf("orderbook has no levels for side %s", side)
 	}
 
+	// Ограничить количество уровней согласно Requirements.md (10 уровней)
+	if len(levels) > MaxOrderbookLevels {
+		levels = levels[:MaxOrderbookLevels]
+	}
+
 	var totalCost float64
 	var filledVolume float64
 
-	// Проход по уровням стакана
+	// Проход по уровням стакана (максимум 10)
 	for _, level := range levels {
 		if filledVolume >= volume {
 			break
@@ -143,10 +152,4 @@ func GetSpread(book *exchanges.OrderBook) (float64, float64, error) {
 	return absSpread, relSpread, nil
 }
 
-// min возвращает минимум из двух float64
-func min(a, b float64) float64 {
-	if a < b {
-		return a
-	}
-	return b
-}
+// Примечание: используется встроенная функция min() из Go 1.21+
