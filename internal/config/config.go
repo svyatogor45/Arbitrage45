@@ -99,6 +99,9 @@ func (c *Config) Validate() error {
 	if c.Database.User == "" {
 		return fmt.Errorf("database.user не может быть пустым")
 	}
+	if c.Database.Password == "" || strings.HasPrefix(c.Database.Password, "${") {
+		return fmt.Errorf("database.password не может быть пустым или нераскрытой переменной окружения")
+	}
 	if c.Database.DBName == "" {
 		return fmt.Errorf("database.dbname не может быть пустым")
 	}
