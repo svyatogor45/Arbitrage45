@@ -16,11 +16,22 @@ type Repository struct {
 // NewRepository создаёт новый экземпляр Repository.
 // Параметры:
 //   - dsn: строка подключения к PostgreSQL (из DatabaseConfig.GetDSN())
-func NewRepository(dsn string) (*Repository, error) {
+//   - maxConnections: максимальное количество соединений в пуле (из конфигурации)
+func NewRepository(dsn string, maxConnections int) (*Repository, error) {
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("не удалось открыть соединение с БД: %w", err)
 	}
+
+	// Настройка пула соединений
+	if maxConnections > 0 {
+		db.SetMaxOpenConns(maxConnections)
+		db.SetMaxIdleConns(maxConnections / 2) // Половина от максимума
+	} else {
+		db.SetMaxOpenConns(20)  // Значение по умолчанию
+		db.SetMaxIdleConns(10)
+	}
+	db.SetConnMaxLifetime(5 * time.Minute) // Максимальное время жизни соединения
 
 	// Проверка соединения
 	if err := db.Ping(); err != nil {
@@ -39,7 +50,13 @@ func (r *Repository) Close() error {
 
 // CreatePair создаёт новую конфигурацию торговой пары.
 // Возвращает ID созданной записи.
+// Перед вставкой выполняется валидация данных.
 func (r *Repository) CreatePair(pair *PairConfig) (int, error) {
+	// Валидация перед вставкой
+	if err := pair.Validate(); err != nil {
+		return 0, fmt.Errorf("ошибка валидации пары: %w", err)
+	}
+
 	query := `
 		INSERT INTO pairs (symbol, volume, entry_spread, exit_spread, num_orders, stop_loss, leverage, status)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -145,7 +162,13 @@ func (r *Repository) GetAllPairs() ([]*PairConfig, error) {
 }
 
 // UpdatePair обновляет конфигурацию пары.
+// Перед обновлением выполняется валидация данных.
 func (r *Repository) UpdatePair(pair *PairConfig) error {
+	// Валидация перед обновлением
+	if err := pair.Validate(); err != nil {
+		return fmt.Errorf("ошибка валидации пары: %w", err)
+	}
+
 	query := `
 		UPDATE pairs
 		SET symbol = $2, volume = $3, entry_spread = $4, exit_spread = $5,

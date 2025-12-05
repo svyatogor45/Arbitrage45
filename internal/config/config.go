@@ -106,6 +106,9 @@ func (c *Config) Validate() error {
 	if c.Database.DBName == "" {
 		return fmt.Errorf("database.dbname не может быть пустым")
 	}
+	if c.Database.MaxConnections < 1 {
+		return fmt.Errorf("database.max_connections должен быть >= 1")
+	}
 
 	// Проверка движка
 	if c.Engine.NumShards < 1 {

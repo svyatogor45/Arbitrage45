@@ -15,11 +15,13 @@ type PriceUpdateCallback func(update *exchanges.PriceUpdate)
 // Aggregator собирает цены со всех бирж и распределяет их по трекерам.
 // Один трекер на символ. Потокобезопасен.
 type Aggregator struct {
-	trackers    map[string]*Tracker          // symbol -> Tracker
-	exchanges   map[string]exchanges.Exchange // exchange name -> Exchange client
-	callback    PriceUpdateCallback          // Callback для отправки событий в Coordinator
-	mu          sync.RWMutex                 // Защита trackers
-	closeCh     chan struct{}                // Канал для graceful shutdown
+	trackers     map[string]*Tracker          // symbol -> Tracker
+	exchanges    map[string]exchanges.Exchange // exchange name -> Exchange client
+	callback     PriceUpdateCallback          // Callback для отправки событий в Coordinator
+	mu           sync.RWMutex                 // Защита trackers
+	closeCh      chan struct{}                // Канал для graceful shutdown
+	closeOnce    sync.Once                    // Защита от повторного close(closeCh)
+	wg           sync.WaitGroup               // Ожидание завершения горутин
 }
 
 // NewAggregator создаёт новый Aggregator.
@@ -160,14 +162,22 @@ func (a *Aggregator) Start() error {
 	}
 
 	// Запустить мониторинг устаревших данных
+	a.wg.Add(1)
 	go a.monitorStaleData()
 
 	return nil
 }
 
 // Stop останавливает Aggregator и закрывает все соединения.
+// Безопасен для многократного вызова благодаря sync.Once.
 func (a *Aggregator) Stop() error {
-	close(a.closeCh)
+	// Защита от повторного закрытия канала (паника)
+	a.closeOnce.Do(func() {
+		close(a.closeCh)
+	})
+
+	// Дождаться завершения всех горутин
+	a.wg.Wait()
 
 	// Отключиться от всех бирж
 	for name, exch := range a.exchanges {
@@ -182,6 +192,8 @@ func (a *Aggregator) Stop() error {
 // monitorStaleData отслеживает устаревшие данные и логирует предупреждения.
 // Данные считаются устаревшими, если не обновлялись более 5 секунд.
 func (a *Aggregator) monitorStaleData() {
+	defer a.wg.Done() // Сигнализируем о завершении горутины
+
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
