@@ -96,7 +96,7 @@ func (m *Machine) Transition(to State) error {
 	// Проверить, разрешён ли переход
 	if !m.canTransition(m.current, to) {
 		return fmt.Errorf(
-			"invalid state transition from %s to %s",
+			"недопустимый переход из состояния '%s' в '%s'",
 			m.current,
 			to,
 		)
