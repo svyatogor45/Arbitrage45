@@ -20,19 +20,38 @@ import (
 // =====================================================================
 
 var (
-	bestPricesHits   uint64 // Количество успешных получений из пула
-	bestPricesMisses uint64 // Количество созданий новых объектов
+	bestPricesGets    uint64 // Общее количество запросов Get()
+	bestPricesCreates uint64 // Количество созданий новых объектов (miss)
+
+	exchangePriceGets    uint64 // Общее количество запросов Get()
+	exchangePriceCreates uint64 // Количество созданий новых объектов (miss)
 )
 
 // GetBestPricesPoolStats возвращает статистику использования пула BestPrices.
-func GetBestPricesPoolStats() (hits, misses uint64) {
-	return atomic.LoadUint64(&bestPricesHits), atomic.LoadUint64(&bestPricesMisses)
+// Возвращает: gets (общее количество запросов), creates (количество созданий новых объектов).
+// Hit rate = (gets - creates) / gets * 100
+func GetBestPricesPoolStats() (gets, creates uint64) {
+	return atomic.LoadUint64(&bestPricesGets), atomic.LoadUint64(&bestPricesCreates)
+}
+
+// BestPricesHitRate возвращает процент успешных получений из кэша.
+// Возвращает значение от 0 до 100.
+func BestPricesHitRate() float64 {
+	gets := atomic.LoadUint64(&bestPricesGets)
+	if gets == 0 {
+		return 0
+	}
+	creates := atomic.LoadUint64(&bestPricesCreates)
+	if creates > gets {
+		return 0 // Защита от переполнения
+	}
+	return float64(gets-creates) / float64(gets) * 100
 }
 
 // ResetBestPricesPoolStats сбрасывает статистику пула.
 func ResetBestPricesPoolStats() {
-	atomic.StoreUint64(&bestPricesHits, 0)
-	atomic.StoreUint64(&bestPricesMisses, 0)
+	atomic.StoreUint64(&bestPricesGets, 0)
+	atomic.StoreUint64(&bestPricesCreates, 0)
 }
 
 // =====================================================================
@@ -42,12 +61,13 @@ func ResetBestPricesPoolStats() {
 // bestPricesPool - пул для переиспользования объектов BestPrices.
 var bestPricesPool = sync.Pool{
 	New: func() interface{} {
-		atomic.AddUint64(&bestPricesMisses, 1)
+		// Увеличиваем счётчик создания новых объектов (cache miss)
+		atomic.AddUint64(&bestPricesCreates, 1)
 		return &BestPrices{}
 	},
 }
 
-// GetBestPrices получает BestPrices из пула.
+// GetBestPricesFromPool получает BestPrices из пула.
 // Объект может содержать данные от предыдущего использования,
 // поэтому все поля нужно установить перед использованием.
 //
@@ -58,11 +78,9 @@ var bestPricesPool = sync.Pool{
 //	bp.CheapestExchange = "bybit"
 //	// ... заполнить остальные поля
 func GetBestPricesFromPool() *BestPrices {
-	obj := bestPricesPool.Get()
-	if obj != nil {
-		atomic.AddUint64(&bestPricesHits, 1)
-	}
-	return obj.(*BestPrices)
+	// Увеличиваем счётчик запросов
+	atomic.AddUint64(&bestPricesGets, 1)
+	return bestPricesPool.Get().(*BestPrices)
 }
 
 // PutBestPrices возвращает BestPrices в пул для повторного использования.
@@ -94,31 +112,46 @@ func (bp *BestPrices) Reset() {
 // ExchangePrice Pool
 // =====================================================================
 
-var (
-	exchangePriceHits   uint64
-	exchangePriceMisses uint64
-)
-
 // GetExchangePricePoolStats возвращает статистику использования пула ExchangePrice.
-func GetExchangePricePoolStats() (hits, misses uint64) {
-	return atomic.LoadUint64(&exchangePriceHits), atomic.LoadUint64(&exchangePriceMisses)
+// Возвращает: gets (общее количество запросов), creates (количество созданий новых объектов).
+func GetExchangePricePoolStats() (gets, creates uint64) {
+	return atomic.LoadUint64(&exchangePriceGets), atomic.LoadUint64(&exchangePriceCreates)
+}
+
+// ExchangePriceHitRate возвращает процент успешных получений из кэша.
+// Возвращает значение от 0 до 100.
+func ExchangePriceHitRate() float64 {
+	gets := atomic.LoadUint64(&exchangePriceGets)
+	if gets == 0 {
+		return 0
+	}
+	creates := atomic.LoadUint64(&exchangePriceCreates)
+	if creates > gets {
+		return 0
+	}
+	return float64(gets-creates) / float64(gets) * 100
+}
+
+// ResetExchangePricePoolStats сбрасывает статистику пула.
+func ResetExchangePricePoolStats() {
+	atomic.StoreUint64(&exchangePriceGets, 0)
+	atomic.StoreUint64(&exchangePriceCreates, 0)
 }
 
 // exchangePricePool - пул для переиспользования объектов ExchangePrice.
 var exchangePricePool = sync.Pool{
 	New: func() interface{} {
-		atomic.AddUint64(&exchangePriceMisses, 1)
+		// Увеличиваем счётчик создания новых объектов (cache miss)
+		atomic.AddUint64(&exchangePriceCreates, 1)
 		return &ExchangePrice{}
 	},
 }
 
 // GetExchangePriceFromPool получает ExchangePrice из пула.
 func GetExchangePriceFromPool() *ExchangePrice {
-	obj := exchangePricePool.Get()
-	if obj != nil {
-		atomic.AddUint64(&exchangePriceHits, 1)
-	}
-	return obj.(*ExchangePrice)
+	// Увеличиваем счётчик запросов
+	atomic.AddUint64(&exchangePriceGets, 1)
+	return exchangePricePool.Get().(*ExchangePrice)
 }
 
 // PutExchangePrice возвращает ExchangePrice в пул.

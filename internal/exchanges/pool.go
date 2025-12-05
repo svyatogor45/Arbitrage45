@@ -20,11 +20,16 @@ import (
 // =====================================================================
 
 // PoolStats содержит статистику использования пулов.
+//
+// Для расчёта hit rate используйте метод HitRate():
+//   - Gets: общее количество запросов к пулу
+//   - Creates: количество созданий новых объектов (cache miss)
+//   - Hit rate = (Gets - Creates) / Gets * 100%
 type PoolStats struct {
-	PriceUpdateHits   uint64 // Количество успешных получений из пула
-	PriceUpdateMisses uint64 // Количество созданий новых объектов
-	OrderBookHits     uint64 // Количество успешных получений из пула
-	OrderBookMisses   uint64 // Количество созданий новых объектов
+	PriceUpdateGets    uint64 // Общее количество запросов GetPriceUpdate()
+	PriceUpdateCreates uint64 // Количество созданий новых объектов (miss)
+	OrderBookGets      uint64 // Общее количество запросов GetOrderBook()
+	OrderBookCreates   uint64 // Количество созданий новых объектов (miss)
 }
 
 var poolStats PoolStats
@@ -32,19 +37,48 @@ var poolStats PoolStats
 // GetPoolStats возвращает статистику использования пулов.
 func GetPoolStats() PoolStats {
 	return PoolStats{
-		PriceUpdateHits:   atomic.LoadUint64(&poolStats.PriceUpdateHits),
-		PriceUpdateMisses: atomic.LoadUint64(&poolStats.PriceUpdateMisses),
-		OrderBookHits:     atomic.LoadUint64(&poolStats.OrderBookHits),
-		OrderBookMisses:   atomic.LoadUint64(&poolStats.OrderBookMisses),
+		PriceUpdateGets:    atomic.LoadUint64(&poolStats.PriceUpdateGets),
+		PriceUpdateCreates: atomic.LoadUint64(&poolStats.PriceUpdateCreates),
+		OrderBookGets:      atomic.LoadUint64(&poolStats.OrderBookGets),
+		OrderBookCreates:   atomic.LoadUint64(&poolStats.OrderBookCreates),
 	}
+}
+
+// PriceUpdateHitRate возвращает процент успешных получений PriceUpdate из кэша.
+// Возвращает значение от 0 до 100.
+// Hit rate = (Gets - Creates) / Gets * 100
+func PriceUpdateHitRate() float64 {
+	gets := atomic.LoadUint64(&poolStats.PriceUpdateGets)
+	if gets == 0 {
+		return 0
+	}
+	creates := atomic.LoadUint64(&poolStats.PriceUpdateCreates)
+	if creates > gets {
+		return 0 // Защита от переполнения
+	}
+	return float64(gets-creates) / float64(gets) * 100
+}
+
+// OrderBookHitRate возвращает процент успешных получений OrderBook из кэша.
+// Возвращает значение от 0 до 100.
+func OrderBookHitRate() float64 {
+	gets := atomic.LoadUint64(&poolStats.OrderBookGets)
+	if gets == 0 {
+		return 0
+	}
+	creates := atomic.LoadUint64(&poolStats.OrderBookCreates)
+	if creates > gets {
+		return 0
+	}
+	return float64(gets-creates) / float64(gets) * 100
 }
 
 // ResetPoolStats сбрасывает статистику пулов.
 func ResetPoolStats() {
-	atomic.StoreUint64(&poolStats.PriceUpdateHits, 0)
-	atomic.StoreUint64(&poolStats.PriceUpdateMisses, 0)
-	atomic.StoreUint64(&poolStats.OrderBookHits, 0)
-	atomic.StoreUint64(&poolStats.OrderBookMisses, 0)
+	atomic.StoreUint64(&poolStats.PriceUpdateGets, 0)
+	atomic.StoreUint64(&poolStats.PriceUpdateCreates, 0)
+	atomic.StoreUint64(&poolStats.OrderBookGets, 0)
+	atomic.StoreUint64(&poolStats.OrderBookCreates, 0)
 }
 
 // =====================================================================
@@ -54,7 +88,8 @@ func ResetPoolStats() {
 // priceUpdatePool - пул для переиспользования объектов PriceUpdate.
 var priceUpdatePool = sync.Pool{
 	New: func() interface{} {
-		atomic.AddUint64(&poolStats.PriceUpdateMisses, 1)
+		// Увеличиваем счётчик создания новых объектов (cache miss)
+		atomic.AddUint64(&poolStats.PriceUpdateCreates, 1)
 		return &PriceUpdate{}
 	},
 }
@@ -71,11 +106,9 @@ var priceUpdatePool = sync.Pool{
 //	update.Symbol = "BTCUSDT"
 //	// ... заполнить остальные поля
 func GetPriceUpdate() *PriceUpdate {
-	obj := priceUpdatePool.Get()
-	if obj != nil {
-		atomic.AddUint64(&poolStats.PriceUpdateHits, 1)
-	}
-	return obj.(*PriceUpdate)
+	// Увеличиваем счётчик запросов
+	atomic.AddUint64(&poolStats.PriceUpdateGets, 1)
+	return priceUpdatePool.Get().(*PriceUpdate)
 }
 
 // PutPriceUpdate возвращает PriceUpdate в пул для повторного использования.
@@ -136,7 +169,8 @@ const maxOrderBookLevels = 20
 // orderbookPool - пул для переиспользования объектов OrderBook.
 var orderbookPool = sync.Pool{
 	New: func() interface{} {
-		atomic.AddUint64(&poolStats.OrderBookMisses, 1)
+		// Увеличиваем счётчик создания новых объектов (cache miss)
+		atomic.AddUint64(&poolStats.OrderBookCreates, 1)
 		return &OrderBook{
 			// Предаллоцировать слайсы для стандартной глубины
 			Bids: make([]Level, 0, defaultOrderBookLevels),
@@ -154,11 +188,9 @@ var orderbookPool = sync.Pool{
 //	defer exchanges.PutOrderBook(book)
 //	book.Bids = append(book.Bids, exchanges.Level{Price: 50000, Quantity: 0.5})
 func GetOrderBook() *OrderBook {
-	obj := orderbookPool.Get()
-	if obj != nil {
-		atomic.AddUint64(&poolStats.OrderBookHits, 1)
-	}
-	return obj.(*OrderBook)
+	// Увеличиваем счётчик запросов
+	atomic.AddUint64(&poolStats.OrderBookGets, 1)
+	return orderbookPool.Get().(*OrderBook)
 }
 
 // PutOrderBook возвращает OrderBook в пул для повторного использования.
