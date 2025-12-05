@@ -59,13 +59,13 @@
 ## Этап 2: Общие интерфейсы и типы данных
 
 ### 2.1. Общие типы для бирж
-- [ ] Создать `internal/exchanges/common.go` - общий интерфейс Exchange:
+- [x] Создать `internal/exchanges/common.go` - общий интерфейс Exchange:
   - `PlaceOrder(req *OrderRequest) (*OrderResponse, error)`
   - `GetBalance(asset string) (*Balance, error)`
   - `SetLeverage(symbol string, leverage int) error`
   - `Connect() error`
   - `Close() error`
-- [ ] Определить типы:
+- [x] Определить типы:
   - `OrderRequest` (Symbol, Side, Type, Quantity, PositionSide)
   - `OrderResponse` (OrderID, FilledQty, AvgPrice, Status)
   - `Balance` (Asset, Available, InPosition)
