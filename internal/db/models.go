@@ -1,7 +1,14 @@
 package db
 
 import (
+	"fmt"
 	"time"
+)
+
+// Константы для валидации leverage
+const (
+	MinLeverage = 1   // Минимальное плечо
+	MaxLeverage = 125 // Максимальное плечо (большинство бирж поддерживают до 125x)
 )
 
 // PairConfig представляет конфигурацию торговой пары.
@@ -67,3 +74,46 @@ const (
 	CloseReasonLiquidation CloseReason = "liquidation" // Ликвидация биржей
 	CloseReasonManual      CloseReason = "manual"      // Ручное закрытие пользователем
 )
+
+// Validate проверяет корректность конфигурации пары.
+// Возвращает ошибку, если какое-либо поле содержит недопустимое значение.
+func (p *PairConfig) Validate() error {
+	if p.Symbol == "" {
+		return fmt.Errorf("symbol не может быть пустым")
+	}
+
+	if p.Volume <= 0 {
+		return fmt.Errorf("volume должен быть положительным")
+	}
+
+	if p.EntrySpread <= 0 {
+		return fmt.Errorf("entry_spread должен быть положительным")
+	}
+
+	if p.ExitSpread < 0 {
+		return fmt.Errorf("exit_spread не может быть отрицательным")
+	}
+
+	if p.NumOrders < 1 {
+		return fmt.Errorf("num_orders должен быть >= 1")
+	}
+
+	if p.Leverage < MinLeverage || p.Leverage > MaxLeverage {
+		return fmt.Errorf("leverage должен быть в диапазоне %d-%d, получено: %d", MinLeverage, MaxLeverage, p.Leverage)
+	}
+
+	// Проверка статуса
+	validStatuses := map[string]bool{
+		string(PairStatusPaused):       true,
+		string(PairStatusReady):        true,
+		string(PairStatusEntering):     true,
+		string(PairStatusPositionOpen): true,
+		string(PairStatusExiting):      true,
+		string(PairStatusError):        true,
+	}
+	if !validStatuses[p.Status] {
+		return fmt.Errorf("недопустимый статус: %s", p.Status)
+	}
+
+	return nil
+}

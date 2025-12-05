@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -134,6 +135,12 @@ func (c *Config) Validate() error {
 		if exchCfg.WsURL == "" {
 			return fmt.Errorf("exchanges.%s.ws_url не может быть пустым", name)
 		}
+		// OKX требует обязательный passphrase для аутентификации
+		if name == "okx" {
+			if exchCfg.Passphrase == "" || strings.HasPrefix(exchCfg.Passphrase, "${") {
+				return fmt.Errorf("exchanges.okx.passphrase обязателен для OKX и не может быть пустым или нераскрытой переменной окружения")
+			}
+		}
 	}
 
 	// Проверка логирования
@@ -158,9 +165,17 @@ func expandEnvVars(data string) string {
 }
 
 // GetDSN возвращает строку подключения к PostgreSQL в формате для database/sql.
+// Корректно экранирует специальные символы в пароле.
 func (d *DatabaseConfig) GetDSN() string {
-	// Экранировать специальные символы в пароле
-	password := strings.ReplaceAll(d.Password, " ", "\\ ")
+	// Для key=value формата PostgreSQL нужно заключить значения со спецсимволами в одинарные кавычки
+	// и экранировать одинарные кавычки внутри значения
+	password := d.Password
+	needsQuotes := strings.ContainsAny(password, " '\\=")
+
+	if needsQuotes {
+		// Экранировать одинарные кавычки и обернуть в кавычки
+		password = "'" + strings.ReplaceAll(password, "'", "\\'") + "'"
+	}
 
 	return fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
@@ -173,11 +188,12 @@ func (d *DatabaseConfig) GetDSN() string {
 }
 
 // GetMigrateDSN возвращает строку подключения для golang-migrate в формате postgres://
+// URL-кодирует спецсимволы в user/password для корректного парсинга.
 func (d *DatabaseConfig) GetMigrateDSN() string {
 	return fmt.Sprintf(
 		"postgres://%s:%s@%s:%d/%s?sslmode=disable",
-		d.User,
-		d.Password,
+		url.QueryEscape(d.User),
+		url.QueryEscape(d.Password),
 		d.Host,
 		d.Port,
 		d.DBName,
