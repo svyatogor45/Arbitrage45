@@ -2,246 +2,18 @@ package pool
 
 import (
 	"sync"
-	"time"
 )
 
 // =====================================================================
-// PriceUpdate Pool
+// Утилитарные пулы для переиспользования памяти
 // =====================================================================
-
-// PriceUpdate представляет обновление цены из WebSocket.
-// Это копия типа из internal/exchanges/common.go для избежания циклических импортов.
-// При получении объекта из пула нужно заполнить все поля, при возврате - сбросить.
-type PriceUpdate struct {
-	Exchange  string        // Название биржи
-	Symbol    string        // Символ торговой пары
-	BestBid   float64       // Лучшая цена покупки
-	BestAsk   float64       // Лучшая цена продажи
-	BidQty    float64       // Объём на лучшем bid
-	AskQty    float64       // Объём на лучшем ask
-	Orderbook *OrderBook    // Полный стакан (опционально)
-	Timestamp time.Time     // Время обновления
-}
-
-// OrderBook представляет стакан ордеров.
-// Копия из internal/exchanges/common.go для избежания циклических импортов.
-type OrderBook struct {
-	Bids     []Level // Уровни покупки (отсортированы по убыванию цены)
-	Asks     []Level // Уровни продажи (отсортированы по возрастанию цены)
-	UpdateID int64   // ID обновления
-}
-
-// Level представляет один уровень в стакане.
-type Level struct {
-	Price    float64 // Цена
-	Quantity float64 // Объём на этом уровне
-}
-
-// priceUpdatePool - пул для переиспользования объектов PriceUpdate.
-// Использует sync.Pool для эффективного повторного использования памяти.
-var priceUpdatePool = sync.Pool{
-	New: func() interface{} {
-		return &PriceUpdate{}
-	},
-}
-
-// GetPriceUpdate получает PriceUpdate из пула.
-// Объект может содержать данные от предыдущего использования,
-// поэтому все поля нужно установить перед использованием.
 //
-// Пример использования:
+// ВАЖНО: Специфичные пулы для типов данных размещены в соответствующих пакетах:
+//   - PriceUpdate, OrderBook → internal/exchanges/pool.go
+//   - BestPrices → internal/core/prices/pool.go
 //
-//	update := pool.GetPriceUpdate()
-//	defer pool.PutPriceUpdate(update)
-//	update.Exchange = "bybit"
-//	update.Symbol = "BTCUSDT"
-//	// ... заполнить остальные поля
-func GetPriceUpdate() *PriceUpdate {
-	return priceUpdatePool.Get().(*PriceUpdate)
-}
-
-// PutPriceUpdate возвращает PriceUpdate в пул для повторного использования.
-// Объект сбрасывается перед возвратом для предотвращения утечки данных.
-//
-// ВАЖНО: После вызова PutPriceUpdate не следует использовать объект!
-func PutPriceUpdate(p *PriceUpdate) {
-	if p == nil {
-		return
-	}
-
-	// Сбросить все поля для предотвращения утечки данных
-	p.Reset()
-
-	priceUpdatePool.Put(p)
-}
-
-// Reset сбрасывает все поля PriceUpdate в нулевые значения.
-// Используется перед возвратом объекта в пул.
-func (p *PriceUpdate) Reset() {
-	p.Exchange = ""
-	p.Symbol = ""
-	p.BestBid = 0
-	p.BestAsk = 0
-	p.BidQty = 0
-	p.AskQty = 0
-	p.Orderbook = nil // Не сбрасываем содержимое OrderBook - он тоже может быть из пула
-	p.Timestamp = time.Time{}
-}
-
+// Это сделано для избежания циклических импортов и дублирования типов.
 // =====================================================================
-// BestPrices Pool
-// =====================================================================
-
-// BestPrices содержит лучшие цены среди всех бирж.
-// Копия из internal/core/prices/tracker.go для избежания циклических импортов.
-type BestPrices struct {
-	CheapestExchange string    // Биржа с самым дешёвым ask (для long)
-	CheapestAsk      float64   // Самая дешёвая цена покупки
-	DearestExchange  string    // Биржа с самым дорогим bid (для short)
-	DearestBid       float64   // Самая дорогая цена продажи
-	NetSpread        float64   // Чистый спред с учётом комиссий (в %)
-	RawSpread        float64   // Сырой спред без комиссий (в %)
-	AbsoluteSpread   float64   // Абсолютный спред в USDT
-	Timestamp        time.Time // Время расчёта
-}
-
-// bestPricesPool - пул для переиспользования объектов BestPrices.
-var bestPricesPool = sync.Pool{
-	New: func() interface{} {
-		return &BestPrices{}
-	},
-}
-
-// GetBestPrices получает BestPrices из пула.
-// Объект может содержать данные от предыдущего использования,
-// поэтому все поля нужно установить перед использованием.
-//
-// Пример использования:
-//
-//	bp := pool.GetBestPrices()
-//	defer pool.PutBestPrices(bp)
-//	bp.CheapestExchange = "bybit"
-//	// ... заполнить остальные поля
-func GetBestPrices() *BestPrices {
-	return bestPricesPool.Get().(*BestPrices)
-}
-
-// PutBestPrices возвращает BestPrices в пул для повторного использования.
-// Объект сбрасывается перед возвратом для предотвращения утечки данных.
-//
-// ВАЖНО: После вызова PutBestPrices не следует использовать объект!
-func PutBestPrices(bp *BestPrices) {
-	if bp == nil {
-		return
-	}
-
-	// Сбросить все поля
-	bp.Reset()
-
-	bestPricesPool.Put(bp)
-}
-
-// Reset сбрасывает все поля BestPrices в нулевые значения.
-func (bp *BestPrices) Reset() {
-	bp.CheapestExchange = ""
-	bp.CheapestAsk = 0
-	bp.DearestExchange = ""
-	bp.DearestBid = 0
-	bp.NetSpread = 0
-	bp.RawSpread = 0
-	bp.AbsoluteSpread = 0
-	bp.Timestamp = time.Time{}
-}
-
-// =====================================================================
-// OrderBook Pool
-// =====================================================================
-
-// orderbookPool - пул для переиспользования объектов OrderBook.
-var orderbookPool = sync.Pool{
-	New: func() interface{} {
-		return &OrderBook{
-			// Предаллоцировать слайсы для 10 уровней (стандартная глубина)
-			Bids: make([]Level, 0, 10),
-			Asks: make([]Level, 0, 10),
-		}
-	},
-}
-
-// GetOrderBook получает OrderBook из пула.
-// Слайсы Bids и Asks предаллоцированы на 10 уровней (стандартная глубина).
-//
-// Пример использования:
-//
-//	book := pool.GetOrderBook()
-//	defer pool.PutOrderBook(book)
-//	book.Bids = append(book.Bids, pool.Level{Price: 50000, Quantity: 0.5})
-//	// ... заполнить остальные поля
-func GetOrderBook() *OrderBook {
-	return orderbookPool.Get().(*OrderBook)
-}
-
-// PutOrderBook возвращает OrderBook в пул для повторного использования.
-// Слайсы очищаются, но capacity сохраняется для эффективного переиспользования.
-//
-// ВАЖНО: После вызова PutOrderBook не следует использовать объект!
-func PutOrderBook(book *OrderBook) {
-	if book == nil {
-		return
-	}
-
-	// Сбросить данные, сохранив capacity слайсов
-	book.Reset()
-
-	orderbookPool.Put(book)
-}
-
-// Reset сбрасывает OrderBook, сохраняя capacity слайсов.
-func (book *OrderBook) Reset() {
-	// Очищаем слайсы, сохраняя capacity
-	book.Bids = book.Bids[:0]
-	book.Asks = book.Asks[:0]
-	book.UpdateID = 0
-}
-
-// =====================================================================
-// Level Slice Pool
-// =====================================================================
-
-// levelSlicePool - пул для слайсов уровней стакана.
-// Используется для временных операций с уровнями.
-var levelSlicePool = sync.Pool{
-	New: func() interface{} {
-		// Предаллоцировать слайс на 10 уровней
-		slice := make([]Level, 0, 10)
-		return &slice
-	},
-}
-
-// GetLevelSlice получает слайс Level из пула.
-// Слайс предаллоцирован на 10 элементов.
-//
-// Пример использования:
-//
-//	levels := pool.GetLevelSlice()
-//	defer pool.PutLevelSlice(levels)
-//	*levels = append(*levels, pool.Level{Price: 50000, Quantity: 0.5})
-func GetLevelSlice() *[]Level {
-	return levelSlicePool.Get().(*[]Level)
-}
-
-// PutLevelSlice возвращает слайс Level в пул.
-// Слайс очищается, но capacity сохраняется.
-func PutLevelSlice(levels *[]Level) {
-	if levels == nil {
-		return
-	}
-
-	// Очистить слайс, сохранив capacity
-	*levels = (*levels)[:0]
-
-	levelSlicePool.Put(levels)
-}
 
 // =====================================================================
 // Bytes Buffer Pool
@@ -276,15 +48,20 @@ func GetBytesBuffer() *BytesBuffer {
 }
 
 // PutBytesBuffer возвращает BytesBuffer в пул.
-// Буфер очищается, но capacity сохраняется.
+// Буфер очищается, но capacity сохраняется (если не превышает лимит).
 func PutBytesBuffer(buf *BytesBuffer) {
 	if buf == nil {
 		return
 	}
 
-	// Очистить буфер, сохранив capacity
-	buf.Bytes = buf.Bytes[:0]
+	// Ограничить capacity для предотвращения утечки памяти
+	// Если буфер вырос слишком большим - не возвращаем в пул
+	const maxCapacity = 64 * 1024 // 64KB
+	if cap(buf.Bytes) > maxCapacity {
+		return // Пусть GC соберёт большой буфер
+	}
 
+	buf.Bytes = buf.Bytes[:0]
 	bytesBufferPool.Put(buf)
 }
 
@@ -312,4 +89,115 @@ func (buf *BytesBuffer) Len() int {
 // Cap возвращает capacity буфера.
 func (buf *BytesBuffer) Cap() int {
 	return cap(buf.Bytes)
+}
+
+// =====================================================================
+// Float64 Slice Pool
+// =====================================================================
+
+// float64SlicePool - пул для слайсов float64.
+// Используется для временных вычислений.
+var float64SlicePool = sync.Pool{
+	New: func() interface{} {
+		slice := make([]float64, 0, 32)
+		return &slice
+	},
+}
+
+// GetFloat64Slice получает слайс float64 из пула.
+// Слайс предаллоцирован на 32 элемента.
+func GetFloat64Slice() *[]float64 {
+	return float64SlicePool.Get().(*[]float64)
+}
+
+// PutFloat64Slice возвращает слайс float64 в пул.
+func PutFloat64Slice(slice *[]float64) {
+	if slice == nil {
+		return
+	}
+
+	// Ограничить capacity
+	const maxCapacity = 256
+	if cap(*slice) > maxCapacity {
+		return
+	}
+
+	*slice = (*slice)[:0]
+	float64SlicePool.Put(slice)
+}
+
+// =====================================================================
+// String Slice Pool
+// =====================================================================
+
+// stringSlicePool - пул для слайсов строк.
+// Используется для временных операций со списками символов/бирж.
+var stringSlicePool = sync.Pool{
+	New: func() interface{} {
+		slice := make([]string, 0, 16)
+		return &slice
+	},
+}
+
+// GetStringSlice получает слайс строк из пула.
+// Слайс предаллоцирован на 16 элементов.
+func GetStringSlice() *[]string {
+	return stringSlicePool.Get().(*[]string)
+}
+
+// PutStringSlice возвращает слайс строк в пул.
+func PutStringSlice(slice *[]string) {
+	if slice == nil {
+		return
+	}
+
+	// Ограничить capacity
+	const maxCapacity = 128
+	if cap(*slice) > maxCapacity {
+		return
+	}
+
+	// Обнулить ссылки для GC
+	for i := range *slice {
+		(*slice)[i] = ""
+	}
+	*slice = (*slice)[:0]
+	stringSlicePool.Put(slice)
+}
+
+// =====================================================================
+// Generic Map Pool (для map[string]interface{})
+// =====================================================================
+
+// mapPool - пул для map[string]interface{}.
+// Используется для парсинга JSON и временных структур.
+var mapPool = sync.Pool{
+	New: func() interface{} {
+		return make(map[string]interface{}, 16)
+	},
+}
+
+// GetMap получает map[string]interface{} из пула.
+func GetMap() map[string]interface{} {
+	return mapPool.Get().(map[string]interface{})
+}
+
+// PutMap возвращает map в пул.
+// Map очищается перед возвратом.
+func PutMap(m map[string]interface{}) {
+	if m == nil {
+		return
+	}
+
+	// Ограничить размер
+	const maxSize = 64
+	if len(m) > maxSize {
+		return
+	}
+
+	// Очистить map
+	for k := range m {
+		delete(m, k)
+	}
+	mapPool.Put(m)
 }
