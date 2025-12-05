@@ -71,13 +71,13 @@
   - `Balance` (Asset, Available, InPosition)
 
 ### 2.2. Типы для цен и стаканов
-- [ ] Создать `internal/core/orderbook/orderbook.go`:
+- [x] Создать `internal/core/orderbook/orderbook.go`:
   - Тип `OrderBook` с уровнями (Level: Price, Quantity)
   - Метод `CalculateAvgPrice(volume float64, side string) float64`
-- [ ] Создать `internal/core/prices/tracker.go`:
+- [x] Создать `internal/core/prices/tracker.go`:
   - Тип `Tracker` для отслеживания лучших цен по символу
   - Методы `Update()`, `GetBestPrices()`, `GetPrice(exchange, side)`
-- [ ] Создать `internal/core/prices/aggregator.go`:
+- [x] Создать `internal/core/prices/aggregator.go`:
   - Тип `Aggregator` для сбора цен со всех бирж
   - Методы `Subscribe(symbol)`, `handlePriceUpdate()`
 
