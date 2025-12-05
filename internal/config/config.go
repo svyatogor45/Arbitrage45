@@ -119,11 +119,11 @@ func (c *Config) Validate() error {
 
 	// Проверка бирж
 	for name, exchCfg := range c.Exchanges {
-		if exchCfg.APIKey == "" {
-			return fmt.Errorf("exchanges.%s.api_key не может быть пустым", name)
+		if exchCfg.APIKey == "" || strings.HasPrefix(exchCfg.APIKey, "${") {
+			return fmt.Errorf("exchanges.%s.api_key не может быть пустым или нераскрытой переменной окружения", name)
 		}
-		if exchCfg.APISecret == "" {
-			return fmt.Errorf("exchanges.%s.api_secret не может быть пустым", name)
+		if exchCfg.APISecret == "" || strings.HasPrefix(exchCfg.APISecret, "${") {
+			return fmt.Errorf("exchanges.%s.api_secret не может быть пустым или нераскрытой переменной окружения", name)
 		}
 		if exchCfg.RestURL == "" {
 			return fmt.Errorf("exchanges.%s.rest_url не может быть пустым", name)
@@ -154,7 +154,7 @@ func expandEnvVars(data string) string {
 	})
 }
 
-// GetDSN возвращает строку подключения к PostgreSQL.
+// GetDSN возвращает строку подключения к PostgreSQL в формате для database/sql.
 func (d *DatabaseConfig) GetDSN() string {
 	// Экранировать специальные символы в пароле
 	password := strings.ReplaceAll(d.Password, " ", "\\ ")
@@ -165,6 +165,18 @@ func (d *DatabaseConfig) GetDSN() string {
 		d.Port,
 		d.User,
 		password,
+		d.DBName,
+	)
+}
+
+// GetMigrateDSN возвращает строку подключения для golang-migrate в формате postgres://
+func (d *DatabaseConfig) GetMigrateDSN() string {
+	return fmt.Sprintf(
+		"postgres://%s:%s@%s:%d/%s?sslmode=disable",
+		d.User,
+		d.Password,
+		d.Host,
+		d.Port,
 		d.DBName,
 	)
 }

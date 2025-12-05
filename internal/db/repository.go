@@ -315,7 +315,7 @@ func (r *Repository) SetLeverage(exchange, symbol string, leverage int) error {
 		INSERT INTO leverage_cache (exchange, symbol, leverage, updated_at)
 		VALUES ($1, $2, $3, NOW())
 		ON CONFLICT (exchange, symbol)
-		DO UPDATE SET leverage = $3, updated_at = NOW()
+		DO UPDATE SET leverage = EXCLUDED.leverage, updated_at = NOW()
 	`
 
 	_, err := r.db.Exec(query, exchange, symbol, leverage)
