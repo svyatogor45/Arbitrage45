@@ -163,8 +163,12 @@ func (a *Aggregator) GetAllSymbols() []string {
 
 // Start запускает Aggregator.
 // Подключает все биржи через WebSocket и начинает получать обновления.
+// При ошибке подключения к одной из бирж, все уже подключённые биржи закрываются.
 func (a *Aggregator) Start() error {
 	a.logger.Info("Запуск Aggregator", zap.Int("exchanges_count", len(a.exchanges)))
+
+	// Список успешно подключённых бирж для cleanup при ошибке
+	connectedExchanges := make([]string, 0, len(a.exchanges))
 
 	// Подключиться ко всем биржам
 	for name, exch := range a.exchanges {
@@ -173,8 +177,13 @@ func (a *Aggregator) Start() error {
 				zap.String("exchange", name),
 				zap.Error(err),
 			)
+
+			// Cleanup: закрыть все уже подключённые биржи
+			a.cleanupConnectedExchanges(connectedExchanges)
+
 			return fmt.Errorf("failed to connect to exchange %s: %w", name, err)
 		}
+		connectedExchanges = append(connectedExchanges, name)
 		a.logger.Info("Подключение к бирже установлено", zap.String("exchange", name))
 	}
 
@@ -184,6 +193,28 @@ func (a *Aggregator) Start() error {
 
 	a.logger.Info("Aggregator успешно запущен")
 	return nil
+}
+
+// cleanupConnectedExchanges закрывает соединения с указанными биржами.
+// Используется для отката при частичной ошибке подключения.
+func (a *Aggregator) cleanupConnectedExchanges(exchangeNames []string) {
+	for _, name := range exchangeNames {
+		exch, exists := a.exchanges[name]
+		if !exists {
+			continue
+		}
+
+		if err := exch.Close(); err != nil {
+			a.logger.Warn("Ошибка при закрытии соединения во время cleanup",
+				zap.String("exchange", name),
+				zap.Error(err),
+			)
+		} else {
+			a.logger.Debug("Соединение закрыто во время cleanup",
+				zap.String("exchange", name),
+			)
+		}
+	}
 }
 
 // Stop останавливает Aggregator и закрывает все соединения.
