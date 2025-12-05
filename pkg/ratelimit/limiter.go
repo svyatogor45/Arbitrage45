@@ -87,7 +87,7 @@ func (l *Limiter) Wait(ctx context.Context) error {
 		l.mu.Unlock()
 
 		// Спать минимум 1ms, максимум waitTime
-		sleepTime := min(waitTime, 100*time.Millisecond)
+		sleepTime := minDuration(waitTime, 100*time.Millisecond)
 		if sleepTime < 1*time.Millisecond {
 			sleepTime = 1 * time.Millisecond
 		}
