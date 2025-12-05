@@ -53,6 +53,14 @@ const (
 
 	// GracefulShutdownTimeout — таймаут ожидания завершения горутин при закрытии.
 	GracefulShutdownTimeout = 5 * time.Second
+
+	// WsSubscribeRateLimit — минимальный интервал между подписками.
+	// Bybit имеет лимит 100 подписок в секунду, используем 50 req/sec для безопасности.
+	WsSubscribeRateLimit = 20 * time.Millisecond
+
+	// CallbackBufferSize — размер буфера для асинхронной обработки callback'ов.
+	// Согласно TZ.md 3.3: "Буфер канала: 2000 на шард"
+	CallbackBufferSize = 2000
 )
 
 // =============================================================================
@@ -69,9 +77,13 @@ const (
 //   - Запись в WebSocket — через sync.Mutex (writeMu)
 //
 // Жизненный цикл горутин:
-//   - runMessageLoop и runPingLoop запускаются при Connect/reconnect
+//   - runMessageLoop, runPingLoop и callbackWorker запускаются при Connect/reconnect
 //   - Завершаются при получении сигнала из closeCh или stopLoopCh
 //   - WaitGroup отслеживает все активные горутины
+//
+// Асинхронные callbacks:
+//   - Callback'и выполняются в отдельной горутине через буферизованный канал
+//   - Это предотвращает блокировку WebSocket чтения при медленных callbacks
 type WebSocketClient struct {
 	url           string          // URL WebSocket сервера
 	conn          *websocket.Conn // Активное соединение (защищено mu)
@@ -81,16 +93,25 @@ type WebSocketClient struct {
 	// Канал закрытия (никогда не пересоздаётся после создания клиента)
 	closeCh chan struct{}
 
+	// Канал для асинхронной обработки callback'ов
+	// Предотвращает блокировку WebSocket читателя при медленных callbacks
+	callbackCh chan *exchanges.PriceUpdate
+
 	// Callbacks и logger (atomic для потокобезопасности без блокировок)
 	callback      atomic.Value // func(*exchanges.PriceUpdate)
 	errorCallback atomic.Value // func(error)
 	logger        atomic.Value // *zap.Logger
 
 	// Состояние (atomic для lock-free доступа)
-	connected     atomic.Bool   // Флаг подключения
-	shouldStop    atomic.Bool   // Флаг остановки (true после вызова Close)
-	reconnecting  atomic.Bool   // Флаг активного reconnect (предотвращает дублирование)
-	reqCounter    atomic.Uint64 // Счётчик запросов для генерации ReqId
+	connected       atomic.Bool   // Флаг подключения
+	shouldStop      atomic.Bool   // Флаг остановки (true после вызова Close)
+	reconnecting    atomic.Bool   // Флаг активного reconnect (предотвращает дублирование)
+	reqCounter      atomic.Uint64 // Счётчик запросов для генерации ReqId
+	callbackMissing atomic.Bool   // Флаг: callback ещё не установлен (для предупреждения)
+
+	// Rate limiting для подписок
+	lastSubscribeTime time.Time  // Время последней подписки
+	subscribeMu       sync.Mutex // Мьютекс для rate limiting подписок
 
 	// Синхронизация
 	mu      sync.RWMutex   // Защита conn, subscriptions, stopLoopCh
@@ -116,14 +137,11 @@ type WebSocketConfig struct {
 // NewWebSocketClient создаёт новый WebSocket клиент.
 //
 // Параметры:
-//   - cfg: конфигурация клиента (Callback обязателен)
+//   - cfg: конфигурация клиента
 //
-// Возвращает ошибку, если Callback не указан.
+// Примечание: Callback можно установить позже через SetPriceCallback,
+// но он должен быть установлен ДО подписки на символы.
 func NewWebSocketClient(cfg WebSocketConfig) (*WebSocketClient, error) {
-	if cfg.Callback == nil {
-		return nil, fmt.Errorf("callback is required")
-	}
-
 	url := cfg.URL
 	if url == "" {
 		url = WsPublicURL
@@ -139,11 +157,20 @@ func NewWebSocketClient(cfg WebSocketConfig) (*WebSocketClient, error) {
 		subscriptions: make(map[string]bool),
 		closeCh:       make(chan struct{}),
 		stopLoopCh:    make(chan struct{}),
+		callbackCh:    make(chan *exchanges.PriceUpdate, CallbackBufferSize),
 	}
 
-	// Устанавливаем callbacks и logger через atomic
+	// Устанавливаем logger через atomic
 	ws.logger.Store(logger)
-	ws.callback.Store(cfg.Callback)
+
+	// Callback опционален при создании, но обязателен перед подпиской
+	if cfg.Callback != nil {
+		ws.callback.Store(cfg.Callback)
+	} else {
+		ws.callbackMissing.Store(true)
+		ws.getLogger().Warn("WebSocket создан без callback — установите через SetPriceCallback перед подпиской")
+	}
+
 	if cfg.ErrorCallback != nil {
 		ws.errorCallback.Store(cfg.ErrorCallback)
 	}
@@ -209,6 +236,11 @@ func (ws *WebSocketClient) Connect() error {
 	// Пересоздаём канал остановки для новых горутин
 	ws.stopLoopCh = make(chan struct{})
 
+	// Пересоздаём канал callback если закрыт
+	if ws.callbackCh == nil {
+		ws.callbackCh = make(chan *exchanges.PriceUpdate, CallbackBufferSize)
+	}
+
 	ws.getLogger().Info("WebSocket подключён",
 		zap.String("url", ws.url),
 	)
@@ -216,10 +248,14 @@ func (ws *WebSocketClient) Connect() error {
 	// Обновляем метрику подключения
 	metrics.SetWebSocketConnected(ExchangeName, true)
 
-	// Запуск горутин обработки
-	ws.wg.Add(2)
+	// Запуск горутин обработки:
+	// - runMessageLoop: читает и парсит сообщения
+	// - runPingLoop: отправляет ping для поддержания соединения
+	// - runCallbackWorker: асинхронно вызывает callbacks (не блокирует WS читатель)
+	ws.wg.Add(3)
 	go ws.runMessageLoop()
 	go ws.runPingLoop()
+	go ws.runCallbackWorker()
 
 	return nil
 }
@@ -402,6 +438,93 @@ func (ws *WebSocketClient) runPingLoop() {
 	}
 }
 
+// runCallbackWorker обрабатывает callback'и асинхронно.
+//
+// Это предотвращает блокировку WebSocket читателя при медленных callbacks.
+// Согласно TZ.md 3.3: использует буферизованный канал для events.
+func (ws *WebSocketClient) runCallbackWorker() {
+	defer ws.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			ws.getLogger().Error("паника в callback worker",
+				zap.Any("panic", r),
+				zap.String("stack", string(debug.Stack())),
+			)
+		}
+	}()
+
+	for {
+		// Проверяем сигналы завершения
+		ws.mu.RLock()
+		stopCh := ws.stopLoopCh
+		ws.mu.RUnlock()
+
+		select {
+		case <-ws.closeCh:
+			return
+		case <-stopCh:
+			return
+		case update := <-ws.callbackCh:
+			if update == nil {
+				continue
+			}
+
+			// Обновляем метрику размера буфера
+			bufferLen := len(ws.callbackCh)
+			metrics.SetChannelBufferSize("bybit_ws", bufferLen)
+
+			// Вызываем callback
+			if cb := ws.callback.Load(); cb != nil {
+				cb.(func(*exchanges.PriceUpdate))(update)
+				// ВАЖНО: callback отвечает за возврат объекта в пул после обработки
+			} else {
+				// Callback не установлен — предупреждаем и возвращаем в пул
+				if ws.callbackMissing.Load() {
+					ws.getLogger().Warn("получены данные без callback — потеряны",
+						zap.String("symbol", update.Symbol),
+					)
+				}
+				// Возвращаем объект в пул (определяем тип по наличию orderbook)
+				if update.Orderbook != nil {
+					exchanges.PutPriceUpdateWithOrderBook(update)
+				} else {
+					exchanges.PutPriceUpdate(update)
+				}
+			}
+		}
+	}
+}
+
+// sendToCallback отправляет обновление в асинхронный callback worker.
+//
+// Неблокирующая операция: если буфер полон, данные отбрасываются с предупреждением.
+// Это предотвращает блокировку WebSocket читателя.
+func (ws *WebSocketClient) sendToCallback(update *exchanges.PriceUpdate) {
+	if update == nil {
+		return
+	}
+
+	// Неблокирующая отправка
+	select {
+	case ws.callbackCh <- update:
+		// Успешно отправлено
+	default:
+		// Буфер полон — отбрасываем и логируем
+		ws.getLogger().Warn("callback буфер переполнен, данные отброшены",
+			zap.String("symbol", update.Symbol),
+			zap.Int("bufferSize", CallbackBufferSize),
+		)
+		metrics.IncrementBufferOverflow("bybit_ws")
+
+		// Возвращаем объект в пул
+		if update.Orderbook != nil {
+			exchanges.PutPriceUpdateWithOrderBook(update)
+		} else {
+			exchanges.PutPriceUpdate(update)
+		}
+	}
+}
+
 // handleConnectionError обрабатывает ошибку соединения и запускает reconnect.
 //
 // Потокобезопасен — все операции с разделяемыми данными под мьютексом.
@@ -475,14 +598,8 @@ func (ws *WebSocketClient) processMessage(data []byte) {
 		// Метрика события
 		metrics.IncrementWebSocketEvent(ExchangeName, update.Symbol, "orderbook")
 
-		// Вызываем callback (потокобезопасно через atomic)
-		if cb := ws.callback.Load(); cb != nil {
-			cb.(func(*exchanges.PriceUpdate))(update)
-			// ВАЖНО: callback отвечает за возврат в пул после обработки
-		} else {
-			// Если callback не установлен, возвращаем объект в пул сразу
-			exchanges.PutPriceUpdateWithOrderBook(update)
-		}
+		// Асинхронная отправка в callback worker (не блокирует WS читатель)
+		ws.sendToCallback(update)
 
 	case MessageTypeTicker:
 		update, err := ParseTickerMessagePooled(data)
@@ -496,12 +613,8 @@ func (ws *WebSocketClient) processMessage(data []byte) {
 		metrics.JSONParsingDuration.WithLabelValues(ExchangeName, "ticker").Observe(parseTimer.ElapsedMs())
 		metrics.IncrementWebSocketEvent(ExchangeName, update.Symbol, "ticker")
 
-		if cb := ws.callback.Load(); cb != nil {
-			cb.(func(*exchanges.PriceUpdate))(update)
-			// ВАЖНО: callback отвечает за возврат в пул после обработки
-		} else {
-			exchanges.PutPriceUpdate(update)
-		}
+		// Асинхронная отправка в callback worker (не блокирует WS читатель)
+		ws.sendToCallback(update)
 
 	case MessageTypePong:
 		// JSON pong от Bybit (в дополнение к WebSocket pong frame)
@@ -656,12 +769,33 @@ func (ws *WebSocketClient) reconnect() {
 			return nil
 		})
 
-		// Успешное подключение — обновляем состояние под мьютексом
+		// Успешное подключение — обновляем состояние
+		// ВАЖНО: Ждём завершения старых горутин ПЕРЕД созданием нового stopLoopCh
+		// для предотвращения race condition
+		oldStopCh := ws.stopLoopCh
+
 		ws.mu.Lock()
 		ws.conn = conn
 		ws.stopLoopCh = make(chan struct{}) // Новый канал для новых горутин
 		ws.connected.Store(true)
+		// Пересоздаём канал callback если закрыт
+		if ws.callbackCh == nil {
+			ws.callbackCh = make(chan *exchanges.PriceUpdate, CallbackBufferSize)
+		}
 		ws.mu.Unlock()
+
+		// Ждём завершения старых горутин (если были)
+		// Это гарантирует, что старые горутины не читают новый stopLoopCh
+		if oldStopCh != nil {
+			select {
+			case <-oldStopCh:
+				// Старый канал уже закрыт
+			default:
+				// Закрываем старый канал и даём время горутинам завершиться
+				close(oldStopCh)
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
 
 		ws.getLogger().Info("переподключение успешно",
 			zap.Int("attempt", attempt),
@@ -673,10 +807,14 @@ func (ws *WebSocketClient) reconnect() {
 		// Восстанавливаем подписки
 		ws.resubscribe()
 
-		// Перезапускаем горутины обработки
-		ws.wg.Add(2)
+		// Перезапускаем горутины обработки:
+		// - runMessageLoop: читает и парсит сообщения
+		// - runPingLoop: отправляет ping для поддержания соединения
+		// - runCallbackWorker: асинхронно вызывает callbacks
+		ws.wg.Add(3)
 		go ws.runMessageLoop()
 		go ws.runPingLoop()
+		go ws.runCallbackWorker()
 
 		return
 	}
@@ -763,10 +901,27 @@ func (ws *WebSocketClient) SubscribeTickers(symbols ...string) error {
 }
 
 // subscribe выполняет подписку на указанные топики.
+//
+// Включает rate limiting для предотвращения блокировки Bybit.
+// Bybit имеет лимит 100 подписок/сек, используем 50 req/sec для безопасности.
 func (ws *WebSocketClient) subscribe(topics ...string) error {
 	if len(topics) == 0 {
 		return nil
 	}
+
+	// Проверяем callback перед подпиской
+	if ws.callbackMissing.Load() {
+		ws.getLogger().Warn("подписка без callback — данные будут потеряны")
+	}
+
+	// Rate limiting: ограничиваем частоту подписок
+	ws.subscribeMu.Lock()
+	elapsed := time.Since(ws.lastSubscribeTime)
+	if elapsed < WsSubscribeRateLimit {
+		time.Sleep(WsSubscribeRateLimit - elapsed)
+	}
+	ws.lastSubscribeTime = time.Now()
+	ws.subscribeMu.Unlock()
 
 	// Генерируем уникальный ReqId для трассировки
 	reqID := ws.nextReqID()
@@ -900,9 +1055,14 @@ func (ws *WebSocketClient) writeMessage(data []byte) error {
 //
 // Потокобезопасен — можно вызывать из любой горутины.
 // Callback получает PriceUpdate из пула и ДОЛЖЕН вернуть его после обработки.
+//
+// ВАЖНО: Callback должен быть установлен ДО подписки на символы,
+// иначе данные будут потеряны.
 func (ws *WebSocketClient) SetCallback(callback func(*exchanges.PriceUpdate)) {
 	if callback != nil {
 		ws.callback.Store(callback)
+		ws.callbackMissing.Store(false) // Сбрасываем флаг
+		ws.getLogger().Debug("callback установлен")
 	}
 }
 
