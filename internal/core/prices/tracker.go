@@ -103,12 +103,16 @@ func (t *Tracker) GetBestPrices() *BestPrices {
 	rawSpread := dearestBid - cheapestAsk
 
 	// Чистый спред с учётом комиссий
-	// Формула: spread - 2 * (feeA + feeB)
+	// Формула: spread - 2 * (feeA + feeB) * avgPrice
 	// Где feeA = комиссия на long бирже, feeB = комиссия на short бирже
+	// avgPrice = средняя цена между cheapestAsk и dearestBid
 	totalFeePercent := config.GetTotalFeePercent(cheapestExchange, dearestExchange)
 
+	// Рассчитать среднюю цену для корректного вычета комиссий
+	avgPrice := (cheapestAsk + dearestBid) / 2
+
 	// Вычитаем комиссии из спреда
-	netSpread := rawSpread - (cheapestAsk * totalFeePercent / 100)
+	netSpread := rawSpread - (avgPrice * totalFeePercent / 100)
 
 	return &BestPrices{
 		CheapestExchange: cheapestExchange,
