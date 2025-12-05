@@ -338,10 +338,13 @@ func (c *RestClient) doRequestWithRetry(ctx context.Context, method, endpoint st
 			break
 		}
 
-		// Добавляем jitter для предотвращения thundering herd
-		// Jitter = random(0, backoff/4) — до 25% от backoff
-		jitter := time.Duration(rand.Int63n(int64(backoff / 4)))
-		waitTime := backoff + jitter
+		// Добавляем Full Jitter для предотвращения thundering herd
+		// Full Jitter: waitTime = backoff/2 + random(0, backoff/2)
+		// Это даёт среднее время = backoff, но с максимальной вариацией
+		// Рекомендация AWS для распределённых систем при массовых сбоях
+		halfBackoff := backoff / 2
+		jitter := time.Duration(rand.Int63n(int64(halfBackoff)))
+		waitTime := halfBackoff + jitter
 
 		c.getLogger().Warn("retry запроса",
 			zap.String("endpoint", endpoint),
