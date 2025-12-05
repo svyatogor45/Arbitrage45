@@ -52,11 +52,30 @@ func NewMachine() *Machine {
 }
 
 // NewMachineWithState создаёт новую State Machine с указанным начальным состоянием.
-func NewMachineWithState(initial State) *Machine {
+// Если состояние невалидное, возвращает nil и ошибку.
+func NewMachineWithState(initial State) (*Machine, error) {
+	// Проверка, что состояние валидное
+	if !isValidState(initial) {
+		return nil, fmt.Errorf("недопустимое начальное состояние: %s", initial)
+	}
+
 	return &Machine{
 		current:    initial,
 		shutdownCh: make(chan struct{}),
+	}, nil
+}
+
+// isValidState проверяет, является ли состояние валидным.
+func isValidState(s State) bool {
+	validStates := map[State]bool{
+		StatePaused:       true,
+		StateReady:        true,
+		StateEntering:     true,
+		StatePositionOpen: true,
+		StateExiting:      true,
+		StateError:        true,
 	}
+	return validStates[s]
 }
 
 // CurrentState возвращает текущее состояние.

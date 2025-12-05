@@ -94,8 +94,19 @@ func (p *PairConfig) Validate() error {
 		return fmt.Errorf("exit_spread не может быть отрицательным")
 	}
 
+	// Кросс-валидация: exit_spread должен быть меньше entry_spread
+	// Иначе арбитраж не имеет смысла (невозможно заработать)
+	if p.ExitSpread >= p.EntrySpread {
+		return fmt.Errorf("exit_spread (%.4f) должен быть меньше entry_spread (%.4f)", p.ExitSpread, p.EntrySpread)
+	}
+
 	if p.NumOrders < 1 {
 		return fmt.Errorf("num_orders должен быть >= 1")
+	}
+
+	// Валидация StopLoss (если задан)
+	if p.StopLoss != nil && *p.StopLoss <= 0 {
+		return fmt.Errorf("stop_loss должен быть положительным, получено: %.2f", *p.StopLoss)
 	}
 
 	if p.Leverage < MinLeverage || p.Leverage > MaxLeverage {
