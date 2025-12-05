@@ -59,33 +59,33 @@
 ## Этап 2: Общие интерфейсы и типы данных
 
 ### 2.1. Общие типы для бирж
-- [ ] Создать `internal/exchanges/common.go` - общий интерфейс Exchange:
+- [x] Создать `internal/exchanges/common.go` - общий интерфейс Exchange:
   - `PlaceOrder(req *OrderRequest) (*OrderResponse, error)`
   - `GetBalance(asset string) (*Balance, error)`
   - `SetLeverage(symbol string, leverage int) error`
   - `Connect() error`
   - `Close() error`
-- [ ] Определить типы:
+- [x] Определить типы:
   - `OrderRequest` (Symbol, Side, Type, Quantity, PositionSide)
   - `OrderResponse` (OrderID, FilledQty, AvgPrice, Status)
   - `Balance` (Asset, Available, InPosition)
 
 ### 2.2. Типы для цен и стаканов
-- [ ] Создать `internal/core/orderbook/orderbook.go`:
+- [x] Создать `internal/core/orderbook/orderbook.go`:
   - Тип `OrderBook` с уровнями (Level: Price, Quantity)
   - Метод `CalculateAvgPrice(volume float64, side string) float64`
-- [ ] Создать `internal/core/prices/tracker.go`:
+- [x] Создать `internal/core/prices/tracker.go`:
   - Тип `Tracker` для отслеживания лучших цен по символу
   - Методы `Update()`, `GetBestPrices()`, `GetPrice(exchange, side)`
-- [ ] Создать `internal/core/prices/aggregator.go`:
+- [x] Создать `internal/core/prices/aggregator.go`:
   - Тип `Aggregator` для сбора цен со всех бирж
   - Методы `Subscribe(symbol)`, `handlePriceUpdate()`
 
 ### 2.3. State Machine
-- [ ] Создать `internal/state/machine.go`:
+- [x] Создать `internal/state/machine.go`:
   - Определить enum состояний: PAUSED, READY, ENTERING, POSITION_OPEN, EXITING, ERROR
   - Тип `Machine` с методами `Transition()`, `CurrentState()`, `CanTransition()`
-- [ ] Создать `internal/state/transitions.go`:
+- [x] Создать `internal/state/transitions.go`:
   - Определить разрешённые переходы между состояниями (map)
 
 ---
