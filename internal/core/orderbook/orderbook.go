@@ -31,11 +31,17 @@ const MaxOrderbookLevels = 10
 // Средняя цена = (0.5*50000 + 0.6*50010 + 0.4*50020) / 1.5 = 50010.67 USDT
 func CalculateAvgPrice(book *exchanges.OrderBook, volume float64, side exchanges.OrderSide) (float64, error) {
 	if book == nil {
-		return 0, fmt.Errorf("orderbook is nil")
+		return 0, fmt.Errorf("стакан ордеров пуст (orderbook is nil)")
 	}
 
 	if volume <= 0 {
-		return 0, fmt.Errorf("volume must be positive")
+		return 0, fmt.Errorf("объём должен быть положительным, получено: %.8f", volume)
+	}
+
+	// Явная валидация стороны ордера для предотвращения некорректных расчётов
+	// Согласно требованию: "обрабатывать все ошибки"
+	if side != exchanges.OrderSideBuy && side != exchanges.OrderSideSell {
+		return 0, fmt.Errorf("некорректная сторона ордера: '%s' (допустимые значения: 'buy' или 'sell')", side)
 	}
 
 	var levels []exchanges.Level
@@ -50,7 +56,7 @@ func CalculateAvgPrice(book *exchanges.OrderBook, volume float64, side exchanges
 	}
 
 	if len(levels) == 0 {
-		return 0, fmt.Errorf("orderbook has no levels for side %s", side)
+		return 0, fmt.Errorf("стакан ордеров не содержит уровней для стороны '%s'", side)
 	}
 
 	// Ограничить количество уровней согласно Requirements.md (10 уровней)
@@ -81,7 +87,7 @@ func CalculateAvgPrice(book *exchanges.OrderBook, volume float64, side exchanges
 	// Проверка: хватило ли ликвидности
 	if filledVolume < volume {
 		return 0, fmt.Errorf(
-			"insufficient liquidity: requested %.8f, available %.8f",
+			"недостаточно ликвидности в стакане: запрошено %.8f, доступно %.8f",
 			volume,
 			filledVolume,
 		)
@@ -104,20 +110,25 @@ func CalculateAvgPrice(book *exchanges.OrderBook, volume float64, side exchanges
 //   - ошибку, если стакан пуст
 func GetBestPrice(book *exchanges.OrderBook, side exchanges.OrderSide) (float64, error) {
 	if book == nil {
-		return 0, fmt.Errorf("orderbook is nil")
+		return 0, fmt.Errorf("стакан ордеров пуст (orderbook is nil)")
+	}
+
+	// Валидация стороны ордера
+	if side != exchanges.OrderSideBuy && side != exchanges.OrderSideSell {
+		return 0, fmt.Errorf("некорректная сторона ордера: '%s' (допустимые значения: 'buy' или 'sell')", side)
 	}
 
 	if side == exchanges.OrderSideBuy {
 		// Для покупки нужна лучшая ask (самая дешёвая цена продажи)
 		if len(book.Asks) == 0 {
-			return 0, fmt.Errorf("no asks in orderbook")
+			return 0, fmt.Errorf("в стакане ордеров отсутствуют предложения на продажу (asks)")
 		}
 		return book.Asks[0].Price, nil
 	}
 
 	// Для продажи нужна лучшая bid (самая дорогая цена покупки)
 	if len(book.Bids) == 0 {
-		return 0, fmt.Errorf("no bids in orderbook")
+		return 0, fmt.Errorf("в стакане ордеров отсутствуют предложения на покупку (bids)")
 	}
 	return book.Bids[0].Price, nil
 }
@@ -133,11 +144,11 @@ func GetBestPrice(book *exchanges.OrderBook, side exchanges.OrderSide) (float64,
 //   - ошибку, если стакан пуст
 func GetSpread(book *exchanges.OrderBook) (float64, float64, error) {
 	if book == nil {
-		return 0, 0, fmt.Errorf("orderbook is nil")
+		return 0, 0, fmt.Errorf("стакан ордеров пуст (orderbook is nil)")
 	}
 
 	if len(book.Bids) == 0 || len(book.Asks) == 0 {
-		return 0, 0, fmt.Errorf("orderbook is incomplete (missing bids or asks)")
+		return 0, 0, fmt.Errorf("стакан ордеров неполный (отсутствуют bids или asks)")
 	}
 
 	bestBid := book.Bids[0].Price
