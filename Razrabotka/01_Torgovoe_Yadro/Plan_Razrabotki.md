@@ -93,18 +93,18 @@
 ## Этап 3: Переиспользуемые компоненты (pkg/)
 
 ### 3.1. Rate Limiting
-- [ ] Создать `pkg/ratelimit/limiter.go`:
+- [x] Создать `pkg/ratelimit/limiter.go`:
   - Реализация Token Bucket алгоритма
   - Методы `Wait()`, `TryAcquire()`
 
 ### 3.2. Object Pooling
-- [ ] Создать `pkg/pool/object_pool.go`:
+- [x] Создать `pkg/pool/object_pool.go`:
   - Пулы для переиспользования объектов:
     - `PriceUpdatePool`
     - `BestPricesPool`
 
 ### 3.3. Метрики Prometheus
-- [ ] Создать `pkg/metrics/prometheus.go`:
+- [x] Создать `pkg/metrics/prometheus.go`:
   - Определить метрики:
     - `tick_to_order_duration_ms` (Histogram)
     - `spread_calculation_duration_ms` (Histogram)
