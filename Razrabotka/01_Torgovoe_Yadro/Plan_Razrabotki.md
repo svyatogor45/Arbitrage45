@@ -133,7 +133,7 @@
     - `getInstrumentInfoREST()` (для минимумов)
   - Метод `doRequest()` с подписью запросов
   - Rate limiter (50% от лимита: 60 req/min)
-- [ ] Создать `internal/exchanges/bybit/parser.go`:
+- [x] Создать `internal/exchanges/bybit/parser.go`:
   - Парсинг JSON ответов Bybit
   - `parseOrderbookMessage()`
   - `parseOrderResponse()`
