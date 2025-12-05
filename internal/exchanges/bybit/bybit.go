@@ -7,8 +7,25 @@ import (
 	"time"
 
 	"arbitrage-terminal/internal/exchanges"
+	"arbitrage-terminal/pkg/metrics"
 
 	"go.uber.org/zap"
+)
+
+// =============================================================================
+// Константы таймаутов
+// =============================================================================
+
+const (
+	// ConnectTimeout — таймаут подключения к бирже.
+	ConnectTimeout = 30 * time.Second
+
+	// OrderOperationTimeout — таймаут для операций с ордерами.
+	// Критически важно для low-latency торговли.
+	OrderOperationTimeout = 5 * time.Second
+
+	// QueryOperationTimeout — таймаут для запросов данных.
+	QueryOperationTimeout = 10 * time.Second
 )
 
 // =============================================================================
@@ -41,6 +58,8 @@ import (
 //
 //	client.SetPriceCallback(func(update *exchanges.PriceUpdate) {
 //	    fmt.Printf("Price update: %+v\n", update)
+//	    // ВАЖНО: вернуть update в пул после использования
+//	    exchanges.PutPriceUpdateWithOrderBook(update)
 //	})
 //
 //	client.Subscribe("BTCUSDT", "ETHUSDT")
@@ -160,7 +179,7 @@ func (c *Client) Connect() error {
 		return nil // Уже подключены
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), ConnectTimeout)
 	defer cancel()
 
 	// Проверяем REST API
@@ -224,8 +243,12 @@ func (c *Client) PlaceOrder(req *exchanges.OrderRequest) (*exchanges.OrderRespon
 		return nil, fmt.Errorf("order request is nil")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Используем короткий таймаут для критических операций
+	ctx, cancel := context.WithTimeout(context.Background(), OrderOperationTimeout)
 	defer cancel()
+
+	// Запускаем таймер для метрики tick-to-order
+	timer := metrics.NewTimer()
 
 	// Конвертируем запрос в формат Bybit
 	bybitReq := &PlaceOrderRequest{
@@ -249,6 +272,9 @@ func (c *Client) PlaceOrder(req *exchanges.OrderRequest) (*exchanges.OrderRespon
 		return nil, err
 	}
 
+	// Записываем метрику tick-to-order (если это было быстрое исполнение после тика)
+	metrics.ObserveTickToOrder(ExchangeName, req.Symbol, timer.ElapsedMs())
+
 	// Конвертируем результат в общий формат
 	return ParsePlaceOrderResult(result, bybitReq), nil
 }
@@ -263,7 +289,7 @@ func (c *Client) PlaceOrder(req *exchanges.OrderRequest) (*exchanges.OrderRespon
 //	balance, err := client.GetBalance("USDT")
 //	fmt.Printf("Available: %.2f, Total: %.2f\n", balance.Available, balance.Total)
 func (c *Client) GetBalance(asset string) (*exchanges.Balance, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), QueryOperationTimeout)
 	defer cancel()
 
 	coinInfo, err := c.rest.GetBalance(ctx, asset)
@@ -283,7 +309,7 @@ func (c *Client) GetBalance(asset string) (*exchanges.Balance, error) {
 // Примечание: если плечо уже установлено на указанное значение,
 // метод возвращает nil без ошибки.
 func (c *Client) SetLeverage(symbol string, leverage int) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), QueryOperationTimeout)
 	defer cancel()
 
 	return c.rest.SetLeverage(ctx, symbol, leverage)
@@ -299,7 +325,7 @@ func (c *Client) SetLeverage(symbol string, leverage int) error {
 //   - symbol: символ торговой пары
 //   - orderID: ID ордера для отмены
 func (c *Client) CancelOrder(symbol, orderID string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), OrderOperationTimeout)
 	defer cancel()
 
 	return c.rest.CancelOrder(ctx, symbol, orderID)
@@ -310,7 +336,7 @@ func (c *Client) CancelOrder(symbol, orderID string) error {
 // Параметры:
 //   - symbol: символ торговой пары (пустая строка = все позиции)
 func (c *Client) GetPositions(symbol string) (*GetPositionsResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), QueryOperationTimeout)
 	defer cancel()
 
 	return c.rest.GetPositions(ctx, symbol)
@@ -323,7 +349,7 @@ func (c *Client) GetPositions(symbol string) (*GetPositionsResult, error) {
 //
 // Возвращает nil, nil если позиция не найдена.
 func (c *Client) GetPosition(symbol string) (*PositionInfo, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), QueryOperationTimeout)
 	defer cancel()
 
 	return c.rest.GetPosition(ctx, symbol)
@@ -334,7 +360,7 @@ func (c *Client) GetPosition(symbol string) (*PositionInfo, error) {
 // Параметры:
 //   - symbol: символ торговой пары (пустая строка = все ордера)
 func (c *Client) GetOrders(symbol string) (*GetOrdersResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), QueryOperationTimeout)
 	defer cancel()
 
 	return c.rest.GetOrders(ctx, symbol)
@@ -347,7 +373,7 @@ func (c *Client) GetOrders(symbol string) (*GetOrdersResult, error) {
 //
 // Возвращает информацию о минимумах, шагах цены/объёма и т.д.
 func (c *Client) GetInstrumentInfo(symbol string) (*InstrumentInfo, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), QueryOperationTimeout)
 	defer cancel()
 
 	return c.rest.GetInstrumentInfo(ctx, symbol)
@@ -368,7 +394,7 @@ func (c *Client) GetInstrumentLimits(symbol string) (*exchanges.InstrumentLimits
 
 // GetWalletBalance возвращает полный баланс кошелька.
 func (c *Client) GetWalletBalance() (*GetWalletBalanceResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), QueryOperationTimeout)
 	defer cancel()
 
 	return c.rest.GetWalletBalance(ctx)
@@ -406,12 +432,17 @@ func (c *Client) Unsubscribe(symbols ...string) error {
 // SetPriceCallback устанавливает callback для получения обновлений цен.
 //
 // Callback вызывается для каждого обновления стакана или тикера.
-// Важно: callback выполняется в горутине WebSocket, не блокируйте его.
+// ВАЖНО:
+//   - Callback выполняется в горутине WebSocket, не блокируйте его
+//   - PriceUpdate получен из пула, после обработки верните его:
+//     exchanges.PutPriceUpdateWithOrderBook(update)
 //
 // Пример:
 //
 //	client.SetPriceCallback(func(update *exchanges.PriceUpdate) {
 //	    aggregator.HandleUpdate(update)
+//	    // После обработки вернуть в пул
+//	    exchanges.PutPriceUpdateWithOrderBook(update)
 //	})
 func (c *Client) SetPriceCallback(callback func(*exchanges.PriceUpdate)) {
 	c.ws.SetCallback(callback)
@@ -448,7 +479,7 @@ func (c *Client) IsConnected() bool {
 
 // Ping проверяет доступность API.
 func (c *Client) Ping() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), QueryOperationTimeout)
 	defer cancel()
 
 	return c.rest.Ping(ctx)

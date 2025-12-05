@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"arbitrage-terminal/internal/exchanges"
+	"arbitrage-terminal/pkg/metrics"
 	"arbitrage-terminal/pkg/ratelimit"
 	"go.uber.org/zap"
 )
@@ -32,6 +33,10 @@ const (
 
 	// DefaultTimeout — таймаут HTTP запросов.
 	DefaultTimeout = 10 * time.Second
+
+	// OrderTimeout — таймаут для критических торговых операций (ордера).
+	// Меньше чем DefaultTimeout для быстрого failover.
+	OrderTimeout = 5 * time.Second
 
 	// RateLimitRequests — безопасный лимит запросов (50% от 120 req/min).
 	RateLimitRequests = 60
@@ -50,13 +55,13 @@ const (
 // RestClient реализует взаимодействие с Bybit REST API V5.
 // Поддерживает подпись запросов HMAC-SHA256 и rate limiting.
 type RestClient struct {
-	httpClient  *http.Client           // HTTP клиент
-	baseURL     string                 // Базовый URL API
-	apiKey      string                 // API ключ
-	apiSecret   string                 // API секрет
-	recvWindow  int                    // Окно приёма (мс)
-	rateLimiter *ratelimit.Limiter     // Rate limiter
-	logger      *zap.Logger            // Логгер
+	httpClient  *http.Client       // HTTP клиент
+	baseURL     string             // Базовый URL API
+	apiKey      string             // API ключ
+	apiSecret   string             // API секрет
+	recvWindow  int                // Окно приёма (мс)
+	rateLimiter *ratelimit.Limiter // Rate limiter
+	logger      *zap.Logger        // Логгер
 }
 
 // RestClientConfig содержит конфигурацию для создания REST клиента.
@@ -222,7 +227,7 @@ func (c *RestClient) doRequest(ctx context.Context, method, endpoint string, par
 		zap.Int64("timestamp", timestamp),
 	)
 
-	// Выполняем запрос
+	// Выполняем запрос и замеряем время
 	startTime := time.Now()
 	resp, err := c.httpClient.Do(req)
 	duration := time.Since(startTime)
@@ -233,6 +238,10 @@ func (c *RestClient) doRequest(ctx context.Context, method, endpoint string, par
 			zap.Duration("duration", duration),
 			zap.Error(err),
 		)
+
+		// Записываем метрику ошибки
+		metrics.IncrementAPIError(ExchangeName, endpoint, "network")
+
 		return &exchanges.ExchangeError{
 			Type:    exchanges.ErrorTypeNetworkError,
 			Message: fmt.Sprintf("HTTP request failed: %v", err),
@@ -254,20 +263,67 @@ func (c *RestClient) doRequest(ctx context.Context, method, endpoint string, par
 		zap.Duration("duration", duration),
 	)
 
-	// Парсим базовый ответ для проверки ошибок
+	// Проверяем HTTP статус код ПЕРЕД парсингом JSON
+	if resp.StatusCode >= 400 {
+		errType := exchanges.ErrorTypeUnknown
+		retry := false
+
+		switch {
+		case resp.StatusCode == 429:
+			errType = exchanges.ErrorTypeRateLimit
+			retry = true
+			metrics.IncrementAPIError(ExchangeName, endpoint, "rate_limit")
+		case resp.StatusCode >= 500:
+			errType = exchanges.ErrorTypeNetworkError
+			retry = true
+			metrics.IncrementAPIError(ExchangeName, endpoint, "server_error")
+		case resp.StatusCode >= 400:
+			errType = exchanges.ErrorTypeUnknown
+			retry = false
+			metrics.IncrementAPIError(ExchangeName, endpoint, "client_error")
+		}
+
+		// Пытаемся извлечь сообщение из ответа
+		var errMsg string
+		var baseResp APIResponseRaw
+		if json.Unmarshal(respBody, &baseResp) == nil && baseResp.RetMsg != "" {
+			errMsg = baseResp.RetMsg
+		} else {
+			// Ограничиваем длину ответа для логирования
+			maxLen := 200
+			if len(respBody) < maxLen {
+				maxLen = len(respBody)
+			}
+			errMsg = string(respBody[:maxLen])
+		}
+
+		c.logger.Warn("bybit HTTP error",
+			zap.Int("status", resp.StatusCode),
+			zap.String("endpoint", endpoint),
+			zap.String("message", errMsg),
+		)
+
+		return &exchanges.ExchangeError{
+			Type:    errType,
+			Code:    resp.StatusCode,
+			Message: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, errMsg),
+			Retry:   retry,
+		}
+	}
+
+	// Парсим базовый ответ для проверки бизнес-ошибок
 	var baseResp APIResponseRaw
 	if err := json.Unmarshal(respBody, &baseResp); err != nil {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	// Проверяем код возврата
+	// Проверяем код возврата API
 	if baseResp.RetCode != RetCodeSuccess {
-		return c.handleAPIError(baseResp.RetCode, baseResp.RetMsg)
+		return c.handleAPIError(endpoint, baseResp.RetCode, baseResp.RetMsg)
 	}
 
 	// Десериализуем результат, если указан
 	if result != nil {
-		// Парсим полный ответ с нужным типом result
 		if err := json.Unmarshal(respBody, result); err != nil {
 			return fmt.Errorf("failed to parse result: %w", err)
 		}
@@ -316,7 +372,7 @@ func (c *RestClient) buildQueryString(params map[string]interface{}) string {
 }
 
 // handleAPIError преобразует код ошибки Bybit в ExchangeError.
-func (c *RestClient) handleAPIError(code int, msg string) *exchanges.ExchangeError {
+func (c *RestClient) handleAPIError(endpoint string, code int, msg string) *exchanges.ExchangeError {
 	errType := exchanges.ErrorTypeUnknown
 	retry := false
 
@@ -324,15 +380,19 @@ func (c *RestClient) handleAPIError(code int, msg string) *exchanges.ExchangeErr
 	case ErrCodeRateLimit:
 		errType = exchanges.ErrorTypeRateLimit
 		retry = true
+		metrics.IncrementAPIError(ExchangeName, endpoint, "rate_limit")
 	case ErrCodeInsufficientBalance:
 		errType = exchanges.ErrorTypeInsufficientMargin
 		retry = false
+		metrics.IncrementAPIError(ExchangeName, endpoint, "insufficient_margin")
 	case ErrCodeInvalidSymbol:
 		errType = exchanges.ErrorTypeInvalidSymbol
 		retry = false
+		metrics.IncrementAPIError(ExchangeName, endpoint, "invalid_symbol")
 	case ErrCodeInvalidQty:
 		errType = exchanges.ErrorTypeInvalidQuantity
 		retry = false
+		metrics.IncrementAPIError(ExchangeName, endpoint, "invalid_quantity")
 	case ErrCodeLeverageNotChanged:
 		// Плечо уже установлено — это не ошибка, можно игнорировать
 		errType = exchanges.ErrorTypeUnknown
@@ -343,11 +403,13 @@ func (c *RestClient) handleAPIError(code int, msg string) *exchanges.ExchangeErr
 			// Системные ошибки — можно повторить
 			retry = true
 		}
+		metrics.IncrementAPIError(ExchangeName, endpoint, "other")
 	}
 
 	c.logger.Warn("bybit API error",
 		zap.Int("code", code),
 		zap.String("message", msg),
+		zap.String("endpoint", endpoint),
 		zap.String("type", string(errType)),
 		zap.Bool("retry", retry),
 	)
@@ -415,17 +477,26 @@ func (c *RestClient) PlaceOrder(ctx context.Context, req *PlaceOrderRequest) (*P
 		params["reduceOnly"] = req.ReduceOnly
 	}
 
+	// Замеряем время исполнения для метрики
+	timer := metrics.NewTimer()
+
 	// Выполняем запрос
 	var resp APIResponse[PlaceOrderResult]
 	if err := c.doRequest(ctx, http.MethodPost, EndpointPlaceOrder, params, &resp); err != nil {
+		// Записываем метрику неудачного ордера
+		metrics.ObserveOrderExecution(ExchangeName, req.Symbol, req.Side, "error", timer.ElapsedMs())
 		return nil, err
 	}
+
+	// Записываем метрику успешного ордера
+	metrics.ObserveOrderExecution(ExchangeName, req.Symbol, req.Side, "success", timer.ElapsedMs())
 
 	c.logger.Info("bybit order placed",
 		zap.String("symbol", req.Symbol),
 		zap.String("side", req.Side),
 		zap.String("qty", req.Qty),
 		zap.String("orderId", resp.Result.OrderID),
+		zap.Float64("latency_ms", timer.ElapsedMs()),
 	)
 
 	return &resp.Result, nil
@@ -505,6 +576,10 @@ func (c *RestClient) GetBalance(ctx context.Context, coin string) (*CoinInfo, er
 	for _, account := range resp.Result.List {
 		for _, coinInfo := range account.Coin {
 			if coinInfo.Coin == coin {
+				// Обновляем метрику баланса
+				if balance, err := ParseFloat(coinInfo.WalletBalance); err == nil {
+					metrics.SetExchangeBalance(ExchangeName, coin, balance)
+				}
 				return &coinInfo, nil
 			}
 		}
@@ -619,6 +694,10 @@ func (c *RestClient) GetPosition(ctx context.Context, symbol string) (*PositionI
 			// Проверяем, что позиция реально открыта (size > 0)
 			size, _ := ParseFloat(pos.Size)
 			if size > 0 {
+				// Обновляем метрику unrealized PNL
+				if pnl, err := ParseFloat(pos.UnrealisedPnl); err == nil {
+					metrics.SetUnrealizedPNL(symbol, pnl)
+				}
 				return &pos, nil
 			}
 		}
