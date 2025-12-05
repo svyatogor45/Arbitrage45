@@ -2,11 +2,16 @@ package metrics
 
 import (
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// registerOnce гарантирует, что метрики регистрируются только один раз.
+// Повторный вызов RegisterMetrics() безопасен и не вызывает панику.
+var registerOnce sync.Once
 
 // =====================================================================
 // Метрики производительности
@@ -232,40 +237,92 @@ var RealizedPNLSummary = prometheus.NewSummaryVec(
 	[]string{"symbol"},
 )
 
+// TickToOrderLatency предоставляет точные percentiles латентности tick-to-order.
+// Используется для SLA мониторинга (p50, p95, p99).
+// Labels: exchange, symbol
+var TickToOrderLatency = prometheus.NewSummaryVec(
+	prometheus.SummaryOpts{
+		Name: "tick_to_order_latency_ms",
+		Help: "Percentiles латентности tick-to-order (мс)",
+		Objectives: map[float64]float64{
+			0.5:  0.05,  // p50 с ошибкой 5%
+			0.95: 0.01,  // p95 с ошибкой 1%
+			0.99: 0.001, // p99 с ошибкой 0.1%
+		},
+	},
+	[]string{"exchange", "symbol"},
+)
+
 // =====================================================================
 // Регистрация метрик
 // =====================================================================
 
-// RegisterMetrics регистрирует все метрики в Prometheus registry.
-// Вызывается один раз при инициализации приложения.
-func RegisterMetrics() {
+// allCollectors содержит все метрики для регистрации.
+// Определяется как переменная для возможности безопасной регистрации.
+var allCollectors = []prometheus.Collector{
 	// Гистограммы производительности
-	prometheus.MustRegister(TickToOrderDuration)
-	prometheus.MustRegister(SpreadCalculationDuration)
-	prometheus.MustRegister(OrderExecutionDuration)
-	prometheus.MustRegister(JSONParsingDuration)
-	prometheus.MustRegister(PriceUpdateProcessingDuration)
+	TickToOrderDuration,
+	SpreadCalculationDuration,
+	OrderExecutionDuration,
+	JSONParsingDuration,
+	PriceUpdateProcessingDuration,
 
 	// Счётчики событий
-	prometheus.MustRegister(WebSocketEventsTotal)
-	prometheus.MustRegister(OrdersTotal)
-	prometheus.MustRegister(ArbitrageCyclesTotal)
-	prometheus.MustRegister(BufferOverflowTotal)
-	prometheus.MustRegister(WebSocketReconnectsTotal)
-	prometheus.MustRegister(APIErrorsTotal)
+	WebSocketEventsTotal,
+	OrdersTotal,
+	ArbitrageCyclesTotal,
+	BufferOverflowTotal,
+	WebSocketReconnectsTotal,
+	APIErrorsTotal,
 
 	// Gauge метрики
-	prometheus.MustRegister(ActiveArbitrages)
-	prometheus.MustRegister(ActivePairs)
-	prometheus.MustRegister(WebSocketConnections)
-	prometheus.MustRegister(ExchangeBalance)
-	prometheus.MustRegister(CurrentSpread)
-	prometheus.MustRegister(UnrealizedPNL)
-	prometheus.MustRegister(TotalRealizedPNL)
-	prometheus.MustRegister(ChannelBufferSize)
+	ActiveArbitrages,
+	ActivePairs,
+	WebSocketConnections,
+	ExchangeBalance,
+	CurrentSpread,
+	UnrealizedPNL,
+	TotalRealizedPNL,
+	ChannelBufferSize,
 
 	// Summary метрики
-	prometheus.MustRegister(RealizedPNLSummary)
+	RealizedPNLSummary,
+	TickToOrderLatency,
+}
+
+// RegisterMetrics регистрирует все метрики в Prometheus registry.
+// Безопасен для повторного вызова - метрики регистрируются только один раз.
+// Использует sync.Once для предотвращения паники при повторной регистрации.
+func RegisterMetrics() {
+	registerOnce.Do(func() {
+		for _, collector := range allCollectors {
+			prometheus.MustRegister(collector)
+		}
+	})
+}
+
+// MustRegisterMetrics регистрирует метрики и паникует при ошибке.
+// Используйте RegisterMetrics() для безопасной регистрации.
+// Этот метод полезен только для явного контроля момента паники.
+func MustRegisterMetrics() {
+	for _, collector := range allCollectors {
+		prometheus.MustRegister(collector)
+	}
+}
+
+// TryRegisterMetrics пытается зарегистрировать метрики без паники.
+// Возвращает ошибку, если регистрация не удалась (кроме AlreadyRegisteredError).
+// Полезен для тестов и случаев, когда нужна явная обработка ошибок.
+func TryRegisterMetrics() error {
+	for _, collector := range allCollectors {
+		if err := prometheus.Register(collector); err != nil {
+			// Игнорируем ошибку "already registered"
+			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Handler возвращает HTTP handler для /metrics endpoint.
@@ -309,9 +366,10 @@ func (t *Timer) Elapsed() time.Duration {
 }
 
 // ObserveTickToOrder записывает метрику tick-to-order.
-// Удобная обёртка для типичного use case.
+// Записывает в обе метрики: Histogram (для bucket'ов) и Summary (для percentiles).
 func ObserveTickToOrder(exchange, symbol string, durationMs float64) {
 	TickToOrderDuration.WithLabelValues(exchange, symbol).Observe(durationMs)
+	TickToOrderLatency.WithLabelValues(exchange, symbol).Observe(durationMs)
 }
 
 // ObserveSpreadCalculation записывает метрику расчёта спреда.

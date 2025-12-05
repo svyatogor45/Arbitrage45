@@ -29,11 +29,11 @@ import (
 //	    // Токен получен, можно делать запрос
 //	}
 type Limiter struct {
-	tokens       float64       // Текущее количество токенов в корзине
-	maxTokens    float64       // Максимальная ёмкость корзины (burst)
-	refillRate   float64       // Скорость добавления токенов (в секунду)
-	lastRefill   time.Time     // Время последнего пополнения
-	mu           sync.Mutex    // Мутекс для защиты tokens и lastRefill
+	tokens     float64    // Текущее количество токенов в корзине
+	maxTokens  float64    // Максимальная ёмкость корзины (burst)
+	refillRate float64    // Скорость добавления токенов (в секунду)
+	lastRefill time.Time  // Время последнего пополнения
+	mu         sync.Mutex // Мутекс для защиты tokens и lastRefill
 }
 
 // NewLimiter создаёт новый Rate Limiter.
@@ -62,45 +62,93 @@ func NewLimiter(requestsPerPeriod int, burst int, period time.Duration) *Limiter
 // Wait ждёт, пока не станет доступен токен, затем забирает его.
 // Блокирующий вызов. Возвращает ошибку, если контекст отменён.
 //
-// Параметры:
-//   - ctx: контекст для отмены ожидания
-//
-// Возвращает ошибку, если контекст отменён до получения токена.
+// Оптимизировано для минимизации нагрузки:
+// - Использует точное время ожидания вместо polling
+// - Переиспользует timer для эффективности
 func (l *Limiter) Wait(ctx context.Context) error {
-	for {
-		// Попытаться получить токен
-		if l.TryAcquire() {
-			return nil
-		}
+	// Быстрый путь: попробовать получить токен сразу
+	if l.TryAcquire() {
+		return nil
+	}
 
-		// Проверить, не отменён ли контекст
+	// Проверить контекст перед ожиданием
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	// Создать timer один раз и переиспользовать
+	timer := time.NewTimer(0)
+	if !timer.Stop() {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-timer.C:
 		default:
 		}
+	}
+	defer timer.Stop()
 
-		// Подождать немного перед следующей попыткой
-		// Время ожидания = время до следующего токена
+	for {
+		// Рассчитать время до следующего токена
 		l.mu.Lock()
+		l.refill()
 		waitTime := l.timeUntilNextToken()
 		l.mu.Unlock()
 
-		// Спать минимум 1ms, максимум waitTime
-		sleepTime := min(waitTime, 100*time.Millisecond)
-		if sleepTime < 1*time.Millisecond {
-			sleepTime = 1 * time.Millisecond
+		// Если токен уже доступен - попробовать получить
+		if waitTime <= 0 {
+			if l.TryAcquire() {
+				return nil
+			}
+			// Кто-то забрал токен раньше нас - повторить
+			continue
 		}
 
-		timer := time.NewTimer(sleepTime)
+		// Ждать точное время до следующего токена
+		timer.Reset(waitTime)
 		select {
 		case <-timer.C:
-			// Продолжить попытки
+			// Попробовать получить токен
+			if l.TryAcquire() {
+				return nil
+			}
+			// Кто-то забрал токен раньше нас - повторить расчёт
 		case <-ctx.Done():
-			timer.Stop()
 			return ctx.Err()
 		}
 	}
+}
+
+// WaitN ждёт, пока не станут доступны N токенов, затем забирает их.
+// Полезно для batch операций (например, выставление двух ордеров одновременно).
+//
+// Параметры:
+//   - ctx: контекст для отмены ожидания
+//   - n: количество требуемых токенов
+//
+// Возвращает ошибку, если контекст отменён до получения всех токенов.
+func (l *Limiter) WaitN(ctx context.Context, n int) error {
+	if n <= 0 {
+		return nil
+	}
+
+	// Для n=1 используем оптимизированный Wait
+	if n == 1 {
+		return l.Wait(ctx)
+	}
+
+	// Быстрый путь: попробовать получить все токены сразу
+	if l.TryAcquireN(n) {
+		return nil
+	}
+
+	// Медленный путь: получать токены по одному
+	for i := 0; i < n; i++ {
+		if err := l.Wait(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // TryAcquire пытается получить токен без ожидания.
@@ -121,11 +169,36 @@ func (l *Limiter) TryAcquire() bool {
 	return false
 }
 
+// TryAcquireN пытается получить N токенов без ожидания.
+// Возвращает true, если все N токенов получены, false иначе.
+// Атомарная операция - либо получаем все N, либо ничего.
+func (l *Limiter) TryAcquireN(n int) bool {
+	if n <= 0 {
+		return true
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.refill()
+
+	if l.tokens >= float64(n) {
+		l.tokens -= float64(n)
+		return true
+	}
+
+	return false
+}
+
 // refill пополняет токены на основе прошедшего времени.
 // Должен вызываться под блокировкой мутекса.
 func (l *Limiter) refill() {
 	now := time.Now()
 	elapsed := now.Sub(l.lastRefill).Seconds()
+
+	if elapsed <= 0 {
+		return
+	}
 
 	// Рассчитать, сколько токенов добавить
 	tokensToAdd := elapsed * l.refillRate
@@ -151,6 +224,28 @@ func (l *Limiter) timeUntilNextToken() time.Duration {
 	return time.Duration(secondsNeeded * float64(time.Second))
 }
 
+// TimeUntilN возвращает время ожидания до получения N токенов.
+// Полезно для планирования batch операций.
+func (l *Limiter) TimeUntilN(n int) time.Duration {
+	if n <= 0 {
+		return 0
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.refill()
+
+	if l.tokens >= float64(n) {
+		return 0
+	}
+
+	tokensNeeded := float64(n) - l.tokens
+	secondsNeeded := tokensNeeded / l.refillRate
+
+	return time.Duration(secondsNeeded * float64(time.Second))
+}
+
 // GetAvailableTokens возвращает текущее количество доступных токенов.
 func (l *Limiter) GetAvailableTokens() float64 {
 	l.mu.Lock()
@@ -160,6 +255,16 @@ func (l *Limiter) GetAvailableTokens() float64 {
 	return l.tokens
 }
 
+// GetRefillRate возвращает скорость пополнения токенов (токенов в секунду).
+func (l *Limiter) GetRefillRate() float64 {
+	return l.refillRate
+}
+
+// GetMaxTokens возвращает максимальную ёмкость корзины (burst).
+func (l *Limiter) GetMaxTokens() float64 {
+	return l.maxTokens
+}
+
 // Reset сбрасывает limiter, заполняя корзину токенами полностью.
 func (l *Limiter) Reset() {
 	l.mu.Lock()
@@ -167,6 +272,28 @@ func (l *Limiter) Reset() {
 
 	l.tokens = l.maxTokens
 	l.lastRefill = time.Now()
+}
+
+// SetRate изменяет скорость пополнения токенов.
+// Параметры такие же, как в NewLimiter.
+func (l *Limiter) SetRate(requestsPerPeriod int, period time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.refillRate = float64(requestsPerPeriod) / period.Seconds()
+	l.lastRefill = time.Now()
+}
+
+// SetBurst изменяет максимальную ёмкость корзины (burst).
+func (l *Limiter) SetBurst(burst int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.maxTokens = float64(burst)
+	// Если текущее количество токенов больше нового burst - обрезать
+	if l.tokens > l.maxTokens {
+		l.tokens = l.maxTokens
+	}
 }
 
 // String возвращает строковое представление состояния limiter.
@@ -182,6 +309,3 @@ func (l *Limiter) String() string {
 		l.refillRate,
 	)
 }
-
-// Примечание: используется встроенная функция min() из Go 1.21+
-// для float64 и time.Duration
