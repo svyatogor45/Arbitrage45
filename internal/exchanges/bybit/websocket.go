@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -78,13 +79,21 @@ type WebSocketClient struct {
 	logger        atomic.Value // *zap.Logger
 
 	// Состояние
-	connected  atomic.Bool // Флаг подключения
-	shouldStop atomic.Bool // Флаг остановки
+	connected  atomic.Bool   // Флаг подключения
+	shouldStop atomic.Bool   // Флаг остановки
+	reqCounter atomic.Uint64 // Счётчик запросов для генерации ReqId
 
 	// Синхронизация
 	mu      sync.RWMutex   // Защита subscriptions и conn
 	writeMu sync.Mutex     // Защита записи в WebSocket
 	wg      sync.WaitGroup // Ожидание завершения горутин
+}
+
+// nextReqID генерирует уникальный ReqId для запросов.
+// Формат: "bybit_{counter}" для трассировки в логах.
+func (ws *WebSocketClient) nextReqID() string {
+	id := ws.reqCounter.Add(1)
+	return "bybit_" + strconv.FormatUint(id, 10)
 }
 
 // WebSocketConfig содержит конфигурацию WebSocket клиента.
@@ -618,10 +627,14 @@ func (ws *WebSocketClient) subscribe(topics ...string) error {
 		return nil
 	}
 
+	// Генерируем уникальный ReqId для трассировки
+	reqID := ws.nextReqID()
+
 	// Формируем запрос подписки
 	req := WsSubscribeRequest{
-		Op:   "subscribe",
-		Args: topics,
+		Op:    "subscribe",
+		ReqId: reqID,
+		Args:  topics,
 	}
 
 	data, err := json.Marshal(req)
@@ -642,6 +655,7 @@ func (ws *WebSocketClient) subscribe(topics ...string) error {
 	ws.mu.Unlock()
 
 	ws.getLogger().Info("subscribed to topics",
+		zap.String("reqId", reqID),
 		zap.Strings("topics", topics),
 	)
 
@@ -669,9 +683,13 @@ func (ws *WebSocketClient) unsubscribe(topics ...string) error {
 		return nil
 	}
 
+	// Генерируем уникальный ReqId для трассировки
+	reqID := ws.nextReqID()
+
 	req := WsUnsubscribeRequest{
-		Op:   "unsubscribe",
-		Args: topics,
+		Op:    "unsubscribe",
+		ReqId: reqID,
+		Args:  topics,
 	}
 
 	data, err := json.Marshal(req)
@@ -691,6 +709,7 @@ func (ws *WebSocketClient) unsubscribe(topics ...string) error {
 	ws.mu.Unlock()
 
 	ws.getLogger().Info("unsubscribed from topics",
+		zap.String("reqId", reqID),
 		zap.Strings("topics", topics),
 	)
 

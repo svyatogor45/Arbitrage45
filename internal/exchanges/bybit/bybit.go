@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"arbitrage-terminal/internal/exchanges"
@@ -18,7 +19,8 @@ import (
 
 const (
 	// ConnectTimeout — таймаут подключения к бирже.
-	ConnectTimeout = 30 * time.Second
+	// Уменьшен до 10s для быстрого failover (Requirements: Tick → Order < 5ms).
+	ConnectTimeout = 10 * time.Second
 
 	// OrderOperationTimeout — таймаут для операций с ордерами.
 	// Критически важно для low-latency торговли.
@@ -63,10 +65,14 @@ const (
 //	})
 //
 //	client.Subscribe("BTCUSDT", "ETHUSDT")
+//
+// Потокобезопасность:
+//   - logger защищён через atomic.Value
+//   - connected защищён через sync.RWMutex
 type Client struct {
 	rest      *RestClient      // REST клиент для торговых операций
 	ws        *WebSocketClient // WebSocket клиент для потоков данных
-	logger    *zap.Logger      // Логгер
+	logger    atomic.Value     // *zap.Logger (atomic для потокобезопасности)
 	connected bool             // Статус подключения
 	mu        sync.RWMutex     // Защита состояния
 }
@@ -148,11 +154,21 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("failed to create WebSocket client: %w", err)
 	}
 
-	return &Client{
-		rest:   restClient,
-		ws:     wsClient,
-		logger: logger,
-	}, nil
+	client := &Client{
+		rest: restClient,
+		ws:   wsClient,
+	}
+	client.logger.Store(logger)
+
+	return client, nil
+}
+
+// getLogger возвращает текущий логгер (потокобезопасно).
+func (c *Client) getLogger() *zap.Logger {
+	if l := c.logger.Load(); l != nil {
+		return l.(*zap.Logger)
+	}
+	return zap.NewNop()
 }
 
 // =============================================================================
@@ -183,18 +199,18 @@ func (c *Client) Connect() error {
 	defer cancel()
 
 	// Проверяем REST API
-	c.logger.Info("connecting to Bybit REST API")
+	c.getLogger().Info("connecting to Bybit REST API")
 	if err := c.rest.Ping(ctx); err != nil {
 		return fmt.Errorf("REST API ping failed: %w", err)
 	}
-	c.logger.Info("Bybit REST API is available")
+	c.getLogger().Info("Bybit REST API is available")
 
 	// Подключаем WebSocket
-	c.logger.Info("connecting to Bybit WebSocket")
+	c.getLogger().Info("connecting to Bybit WebSocket")
 	if err := c.ws.Connect(); err != nil {
 		return fmt.Errorf("WebSocket connection failed: %w", err)
 	}
-	c.logger.Info("Bybit WebSocket connected")
+	c.getLogger().Info("Bybit WebSocket connected")
 
 	c.connected = true
 	return nil
@@ -209,15 +225,15 @@ func (c *Client) Close() error {
 		return nil
 	}
 
-	c.logger.Info("closing Bybit connections")
+	c.getLogger().Info("closing Bybit connections")
 
 	// Закрываем WebSocket
 	if err := c.ws.Close(); err != nil {
-		c.logger.Warn("error closing WebSocket", zap.Error(err))
+		c.getLogger().Warn("error closing WebSocket", zap.Error(err))
 	}
 
 	c.connected = false
-	c.logger.Info("Bybit connections closed")
+	c.getLogger().Info("Bybit connections closed")
 
 	return nil
 }
@@ -498,10 +514,13 @@ func (c *Client) GetWebSocketClient() *WebSocketClient {
 }
 
 // SetLogger устанавливает логгер для всех компонентов.
+// Потокобезопасен — можно вызывать из любой горутины.
 func (c *Client) SetLogger(logger *zap.Logger) {
-	c.logger = logger
-	c.rest.SetLogger(logger)
-	c.ws.SetLogger(logger)
+	if logger != nil {
+		c.logger.Store(logger)
+		c.rest.SetLogger(logger)
+		c.ws.SetLogger(logger)
+	}
 }
 
 // =============================================================================
