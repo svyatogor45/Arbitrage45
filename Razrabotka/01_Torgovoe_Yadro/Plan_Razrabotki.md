@@ -125,7 +125,7 @@
 - [x] Создать `internal/exchanges/bybit/types.go`:
   - Специфичные типы для Bybit API
   - `BybitOrderResponse`, `BybitWebSocketMessage`
-- [ ] Создать `internal/exchanges/bybit/rest.go`:
+- [x] Создать `internal/exchanges/bybit/rest.go`:
   - Методы REST API:
     - `placeOrderREST()`
     - `getBalanceREST()`
