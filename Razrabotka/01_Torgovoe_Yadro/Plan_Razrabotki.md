@@ -43,16 +43,16 @@
 - [x] Реализовать загрузку переменных окружения для API ключей
 
 ### 1.3. База данных
-- [ ] Создать `internal/db/models.go` - модели данных (PairConfig, Trade, LeverageCache)
-- [ ] Создать SQL миграции:
+- [x] Создать `internal/db/models.go` - модели данных (PairConfig, Trade, LeverageCache)
+- [x] Создать SQL миграции:
   - `internal/db/migrations/001_create_pairs.up.sql`
   - `internal/db/migrations/001_create_pairs.down.sql`
   - `internal/db/migrations/002_create_trades.up.sql`
   - `internal/db/migrations/002_create_trades.down.sql`
   - `internal/db/migrations/003_create_leverage_cache.up.sql`
   - `internal/db/migrations/003_create_leverage_cache.down.sql`
-- [ ] Создать `internal/db/repository.go` - CRUD операции для работы с БД
-- [ ] Добавить инструмент для миграций (например, `golang-migrate/migrate`)
+- [x] Создать `internal/db/repository.go` - CRUD операции для работы с БД
+- [x] Добавить инструмент для миграций (например, `golang-migrate/migrate`)
 
 ---
 
