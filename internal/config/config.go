@@ -123,6 +123,14 @@ func (c *Config) Validate() error {
 	if c.Engine.MaxConcurrentArbs < 1 {
 		return fmt.Errorf("engine.max_concurrent_arbs должен быть >= 1")
 	}
+	// Валидация интервала обновления балансов (Requirements.md: диапазон 30s-300s)
+	// Защита от panic в time.NewTicker при нулевом/отрицательном значении
+	if c.Engine.BalanceUpdateInterval < 30*time.Second {
+		return fmt.Errorf("engine.balance_update_interval должен быть >= 30s, получено: %v", c.Engine.BalanceUpdateInterval)
+	}
+	if c.Engine.BalanceUpdateInterval > 300*time.Second {
+		return fmt.Errorf("engine.balance_update_interval должен быть <= 300s, получено: %v", c.Engine.BalanceUpdateInterval)
+	}
 
 	// Проверка бирж
 	for name, exchCfg := range c.Exchanges {
