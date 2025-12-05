@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -78,6 +79,17 @@ const (
 // RestClient — REST клиент для Bybit API
 // =============================================================================
 
+// InstrumentCacheTTL — время жизни кеша информации об инструментах.
+// Данные инструментов (min qty, tick size) редко меняются.
+// Согласно Requirements.md: "Обновляем раз в сутки"
+const InstrumentCacheTTL = 1 * time.Hour
+
+// instrumentCacheEntry представляет запись в кеше инструментов.
+type instrumentCacheEntry struct {
+	info      *InstrumentInfo
+	expiresAt time.Time
+}
+
 // RestClient реализует взаимодействие с Bybit REST API V5.
 // Поддерживает подпись запросов HMAC-SHA256, rate limiting и retry с backoff.
 //
@@ -85,6 +97,7 @@ const (
 //   - Раздельные rate limiters для trade и query операций
 //   - Автоматический retry для retryable ошибок с jitter
 //   - Таймаут управляется через контекст (не HTTP клиентом)
+//   - Кеширование информации об инструментах (min qty, tick size)
 //
 // Потокобезопасность:
 //   - Все поля защищены через atomic или являются immutable
@@ -92,6 +105,7 @@ const (
 //   - retryEnabled, maxRetries защищены через atomic
 //   - Rate limiters потокобезопасны
 //   - HTTP клиент потокобезопасен
+//   - instrumentCache защищён sync.RWMutex
 type RestClient struct {
 	httpClient        *http.Client       // HTTP клиент (без глобального timeout)
 	baseURL           string             // Базовый URL API
@@ -104,6 +118,10 @@ type RestClient struct {
 	retryEnabled      atomic.Bool        // Флаг включения retry (atomic для потокобезопасности)
 	maxRetries        atomic.Int32       // Максимальное количество retry (atomic)
 	initialRetryDelay time.Duration      // Начальная задержка retry (immutable после создания)
+
+	// Кеш информации об инструментах
+	instrumentCache   map[string]*instrumentCacheEntry // symbol -> entry
+	instrumentCacheMu sync.RWMutex                     // Защита кеша
 }
 
 // RestClientConfig содержит конфигурацию для создания REST клиента.
@@ -198,6 +216,7 @@ func NewRestClient(cfg RestClientConfig) (*RestClient, error) {
 		tradeLimiter:      tradeLimiter,
 		queryLimiter:      queryLimiter,
 		initialRetryDelay: initialRetryDelay,
+		instrumentCache:   make(map[string]*instrumentCacheEntry),
 	}
 
 	// Устанавливаем atomic значения
@@ -961,6 +980,9 @@ func (c *RestClient) GetInstruments(ctx context.Context, symbol string) (*GetIns
 
 // GetInstrumentInfo возвращает информацию о конкретном инструменте.
 //
+// Использует кеширование: данные инструментов (min qty, tick size) редко меняются.
+// Кеш обновляется раз в час (InstrumentCacheTTL).
+//
 // Параметры:
 //   - ctx: контекст для отмены
 //   - symbol: символ торговой пары
@@ -968,6 +990,17 @@ func (c *RestClient) GetInstruments(ctx context.Context, symbol string) (*GetIns
 // Возвращает информацию о минимумах, шагах цены/объёма и т.д.
 // Использует query rate limiter.
 func (c *RestClient) GetInstrumentInfo(ctx context.Context, symbol string) (*InstrumentInfo, error) {
+	// Проверяем кеш (read lock)
+	c.instrumentCacheMu.RLock()
+	if entry, ok := c.instrumentCache[symbol]; ok {
+		if time.Now().Before(entry.expiresAt) {
+			c.instrumentCacheMu.RUnlock()
+			return entry.info, nil
+		}
+	}
+	c.instrumentCacheMu.RUnlock()
+
+	// Кеш пуст или устарел — делаем запрос
 	result, err := c.GetInstruments(ctx, symbol)
 	if err != nil {
 		return nil, err
@@ -975,11 +1008,37 @@ func (c *RestClient) GetInstrumentInfo(ctx context.Context, symbol string) (*Ins
 
 	for _, inst := range result.List {
 		if inst.Symbol == symbol {
+			// Копируем данные для кеша
+			infoCopy := inst
+
+			// Сохраняем в кеш (write lock)
+			c.instrumentCacheMu.Lock()
+			c.instrumentCache[symbol] = &instrumentCacheEntry{
+				info:      &infoCopy,
+				expiresAt: time.Now().Add(InstrumentCacheTTL),
+			}
+			c.instrumentCacheMu.Unlock()
+
+			c.getLogger().Debug("инструмент закеширован",
+				zap.String("symbol", symbol),
+				zap.Duration("ttl", InstrumentCacheTTL),
+			)
+
 			return &inst, nil
 		}
 	}
 
 	return nil, fmt.Errorf("инструмент %s не найден", symbol)
+}
+
+// InvalidateInstrumentCache очищает кеш информации об инструментах.
+//
+// Вызывается при необходимости принудительного обновления данных.
+func (c *RestClient) InvalidateInstrumentCache() {
+	c.instrumentCacheMu.Lock()
+	c.instrumentCache = make(map[string]*instrumentCacheEntry)
+	c.instrumentCacheMu.Unlock()
+	c.getLogger().Debug("кеш инструментов очищен")
 }
 
 // =============================================================================

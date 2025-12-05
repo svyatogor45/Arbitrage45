@@ -154,14 +154,13 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("failed to create REST client: %w", err)
 	}
 
-	// Создаём Public WebSocket клиент (callback установим позже)
+	// Создаём Public WebSocket клиент
+	// ВАЖНО: Callback НЕ передаётся здесь — будет установлен через SetPriceCallback
+	// ДО подписки на символы. Это предотвращает потерю данных.
 	wsClient, err := NewWebSocketClient(WebSocketConfig{
 		URL:    cfg.WsURL,
 		Logger: logger,
-		// Callback будет установлен через SetPriceCallback
-		Callback: func(update *exchanges.PriceUpdate) {
-			// Пустой callback по умолчанию, будет заменён
-		},
+		// Callback: nil — будет установлен через SetPriceCallback
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create WebSocket client: %w", err)

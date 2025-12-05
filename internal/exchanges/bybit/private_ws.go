@@ -1,6 +1,7 @@
 package bybit
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -96,16 +97,20 @@ type PrivateWebSocketClient struct {
 	// Канал закрытия (никогда не пересоздаётся)
 	closeCh chan struct{}
 
+	// Канал для ожидания результата аутентификации
+	authResultCh chan error
+
 	// Callbacks (atomic для потокобезопасности)
 	positionCallback  atomic.Value // func(*PositionEvent)
 	executionCallback atomic.Value // func(*ExecutionEvent)
+	walletCallback    atomic.Value // func(*WalletEvent) — для мониторинга баланса
 	errorCallback     atomic.Value // func(error)
 	logger            atomic.Value // *zap.Logger
 
 	// Состояние
-	connected    atomic.Bool // Флаг подключения
-	shouldStop   atomic.Bool // Флаг остановки
-	reconnecting atomic.Bool // Флаг активного reconnect
+	connected    atomic.Bool   // Флаг подключения
+	shouldStop   atomic.Bool   // Флаг остановки
+	reconnecting atomic.Bool   // Флаг активного reconnect
 	reqCounter   atomic.Uint64 // Счётчик запросов
 
 	// Синхронизация
@@ -114,15 +119,28 @@ type PrivateWebSocketClient struct {
 	wg      sync.WaitGroup // Ожидание завершения горутин
 }
 
+// WalletEvent представляет событие обновления баланса.
+// Используется для real-time мониторинга маржи согласно TZ.md.
+type WalletEvent struct {
+	AccountType     string    // Тип аккаунта (UNIFIED, CONTRACT)
+	Coin            string    // Монета (например, USDT)
+	WalletBalance   float64   // Общий баланс кошелька
+	AvailableMargin float64   // Доступная маржа
+	UsedMargin      float64   // Использованная маржа
+	UnrealizedPNL   float64   // Нереализованный PNL
+	Timestamp       time.Time // Время события
+}
+
 // PrivateWebSocketConfig содержит конфигурацию приватного WebSocket.
 type PrivateWebSocketConfig struct {
-	URL               string               // URL (по умолчанию WsPrivateURL)
-	APIKey            string               // API ключ (обязательный)
-	APISecret         string               // API секрет (обязательный)
-	PositionCallback  func(*PositionEvent) // Callback для обновлений позиций
+	URL               string                // URL (по умолчанию WsPrivateURL)
+	APIKey            string                // API ключ (обязательный)
+	APISecret         string                // API секрет (обязательный)
+	PositionCallback  func(*PositionEvent)  // Callback для обновлений позиций
 	ExecutionCallback func(*ExecutionEvent) // Callback для исполнений
-	ErrorCallback     func(error)          // Callback для ошибок
-	Logger            *zap.Logger          // Логгер
+	WalletCallback    func(*WalletEvent)    // Callback для обновлений баланса
+	ErrorCallback     func(error)           // Callback для ошибок
+	Logger            *zap.Logger           // Логгер
 }
 
 // NewPrivateWebSocketClient создаёт новый приватный WebSocket клиент.
@@ -150,11 +168,12 @@ func NewPrivateWebSocketClient(cfg PrivateWebSocketConfig) (*PrivateWebSocketCli
 	}
 
 	ws := &PrivateWebSocketClient{
-		url:        url,
-		apiKey:     cfg.APIKey,
-		apiSecret:  cfg.APISecret,
-		closeCh:    make(chan struct{}),
-		stopLoopCh: make(chan struct{}),
+		url:          url,
+		apiKey:       cfg.APIKey,
+		apiSecret:    cfg.APISecret,
+		closeCh:      make(chan struct{}),
+		stopLoopCh:   make(chan struct{}),
+		authResultCh: make(chan error, 1), // Буферизованный канал для результата аутентификации
 	}
 
 	// Устанавливаем callbacks через atomic
@@ -164,6 +183,9 @@ func NewPrivateWebSocketClient(cfg PrivateWebSocketConfig) (*PrivateWebSocketCli
 	}
 	if cfg.ExecutionCallback != nil {
 		ws.executionCallback.Store(cfg.ExecutionCallback)
+	}
+	if cfg.WalletCallback != nil {
+		ws.walletCallback.Store(cfg.WalletCallback)
 	}
 	if cfg.ErrorCallback != nil {
 		ws.errorCallback.Store(cfg.ErrorCallback)
@@ -189,6 +211,7 @@ func (ws *PrivateWebSocketClient) getLogger() *zap.Logger {
 // После успешной аутентификации автоматически подписывается на:
 //   - position — обновления позиций (включая ликвидации)
 //   - execution — исполнения ордеров
+//   - wallet — обновления баланса для мониторинга маржи
 func (ws *PrivateWebSocketClient) Connect() error {
 	if ws.shouldStop.Load() {
 		return fmt.Errorf("private websocket client is closed")
@@ -228,15 +251,27 @@ func (ws *PrivateWebSocketClient) Connect() error {
 	ws.connected.Store(true)
 	ws.stopLoopCh = make(chan struct{})
 
+	// Пересоздаём канал для результата аутентификации (очищаем старые данные)
+	ws.authResultCh = make(chan error, 1)
+
 	ws.getLogger().Info("приватный WebSocket подключён",
 		zap.String("url", ws.url),
 	)
 
-	// Аутентификация
+	// ВАЖНО: Сначала запускаем горутины для обработки сообщений,
+	// чтобы получить ответ на аутентификацию
+	ws.wg.Add(2)
+	go ws.runMessageLoop()
+	go ws.runPingLoop()
+
+	// Аутентификация с ожиданием подтверждения
 	if err := ws.authenticate(); err != nil {
+		// Останавливаем горутины
+		close(ws.stopLoopCh)
 		conn.Close()
 		ws.conn = nil
 		ws.connected.Store(false)
+		ws.authenticated.Store(false)
 		return fmt.Errorf("authentication failed: %w", err)
 	}
 
@@ -248,15 +283,13 @@ func (ws *PrivateWebSocketClient) Connect() error {
 		// Продолжаем работу — подписка будет восстановлена при reconnect
 	}
 
-	// Запуск горутин обработки
-	ws.wg.Add(2)
-	go ws.runMessageLoop()
-	go ws.runPingLoop()
-
 	return nil
 }
 
 // authenticate выполняет аутентификацию на приватном WebSocket.
+//
+// Отправляет запрос аутентификации и ожидает подтверждение от сервера
+// с таймаутом PrivateWsAuthTimeout.
 //
 // Формат подписи: HMAC-SHA256(expires + "GET/realtime")
 func (ws *PrivateWebSocketClient) authenticate() error {
@@ -291,20 +324,39 @@ func (ws *PrivateWebSocketClient) authenticate() error {
 
 	ws.getLogger().Debug("auth запрос отправлен, ожидаем подтверждение")
 
-	// Ожидаем подтверждение аутентификации
-	// (в production лучше использовать channel с таймаутом)
-	ws.authenticated.Store(true)
+	// Ожидаем подтверждение аутентификации с таймаутом
+	select {
+	case err := <-ws.authResultCh:
+		if err != nil {
+			ws.getLogger().Error("аутентификация не удалась",
+				zap.Error(err),
+			)
+			return err
+		}
+		ws.authenticated.Store(true)
+		ws.getLogger().Info("приватный WebSocket аутентифицирован")
+		return nil
 
-	ws.getLogger().Info("приватный WebSocket аутентифицирован")
-	return nil
+	case <-time.After(PrivateWsAuthTimeout):
+		return fmt.Errorf("таймаут ожидания ответа аутентификации (%v)", PrivateWsAuthTimeout)
+
+	case <-ws.closeCh:
+		return fmt.Errorf("клиент закрыт во время аутентификации")
+	}
 }
 
 // subscribeToPrivateTopics подписывается на приватные топики.
+//
+// Топики согласно TZ.md:
+//   - position — для мониторинга ликвидаций (TZ.md 2.5C)
+//   - execution — для отслеживания исполнений с флагом isLiquidation
+//   - wallet — для real-time мониторинга маржи
 func (ws *PrivateWebSocketClient) subscribeToPrivateTopics() error {
-	// Подписка на позиции и исполнения
+	// Подписка на позиции, исполнения и баланс
 	topics := []string{
-		"position",   // Обновления позиций (включая ликвидации)
-		"execution",  // Исполнения ордеров
+		"position",  // Обновления позиций (включая ликвидации)
+		"execution", // Исполнения ордеров (с флагом isLiquidation)
+		"wallet",    // Обновления баланса для мониторинга маржи
 	}
 
 	req := WsSubscribeRequest{
@@ -408,68 +460,98 @@ func (ws *PrivateWebSocketClient) processMessage(data []byte) {
 		ws.handlePositionMessage(data)
 	case "execution":
 		ws.handleExecutionMessage(data)
+	case "wallet":
+		ws.handleWalletMessage(data)
 	case "pong":
 		metrics.IncrementWebSocketEvent(ExchangeName, "", "private_pong")
 	case "subscribe":
 		ws.getLogger().Debug("приватная подписка подтверждена")
 	case "auth":
-		ws.getLogger().Debug("аутентификация подтверждена")
+		ws.handleAuthResponse(data)
 	default:
 		// Игнорируем неизвестные сообщения
 	}
 }
 
 // detectPrivateMessageType определяет тип приватного сообщения.
+//
+// Использует оптимизированный bytes.Contains из stdlib (SIMD на поддерживаемых платформах).
 func (ws *PrivateWebSocketClient) detectPrivateMessageType(data []byte) string {
-	// Быстрая проверка через bytes.Contains
-	if containsBytes(data, []byte(`"topic":"position"`)) {
+	// Быстрая проверка через bytes.Contains (оптимизирован stdlib)
+	if bytes.Contains(data, []byte(`"topic":"position"`)) {
 		return "position"
 	}
-	if containsBytes(data, []byte(`"topic":"execution"`)) {
+	if bytes.Contains(data, []byte(`"topic":"execution"`)) {
 		return "execution"
 	}
-	if containsBytes(data, []byte(`"op":"pong"`)) {
+	if bytes.Contains(data, []byte(`"topic":"wallet"`)) {
+		return "wallet"
+	}
+	if bytes.Contains(data, []byte(`"op":"pong"`)) {
 		return "pong"
 	}
-	if containsBytes(data, []byte(`"op":"subscribe"`)) {
+	if bytes.Contains(data, []byte(`"op":"subscribe"`)) {
 		return "subscribe"
 	}
-	if containsBytes(data, []byte(`"op":"auth"`)) {
+	if bytes.Contains(data, []byte(`"op":"auth"`)) {
 		return "auth"
 	}
 	return "unknown"
-}
-
-// containsBytes проверяет наличие подстроки.
-func containsBytes(data, pattern []byte) bool {
-	for i := 0; i <= len(data)-len(pattern); i++ {
-		if bytesEqual(data[i:i+len(pattern)], pattern) {
-			return true
-		}
-	}
-	return false
-}
-
-// bytesEqual сравнивает два слайса байт.
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // =============================================================================
 // Обработчики событий
 // =============================================================================
 
+// WsAuthResponse представляет ответ на аутентификацию.
+type WsAuthResponse struct {
+	Op      string `json:"op"`
+	Success bool   `json:"success"`
+	RetMsg  string `json:"retMsg"`
+	ConnId  string `json:"connId"`
+}
+
+// handleAuthResponse обрабатывает ответ на аутентификацию.
+//
+// Отправляет результат в authResultCh для разблокировки метода authenticate().
+func (ws *PrivateWebSocketClient) handleAuthResponse(data []byte) {
+	var resp WsAuthResponse
+	if err := jsonFast.Unmarshal(data, &resp); err != nil {
+		ws.getLogger().Warn("ошибка парсинга auth ответа",
+			zap.Error(err),
+		)
+		// Отправляем ошибку в канал (неблокирующая отправка)
+		select {
+		case ws.authResultCh <- fmt.Errorf("ошибка парсинга auth ответа: %w", err):
+		default:
+		}
+		return
+	}
+
+	if resp.Success {
+		ws.getLogger().Debug("auth ответ получен",
+			zap.String("connId", resp.ConnId),
+		)
+		// Отправляем успешный результат
+		select {
+		case ws.authResultCh <- nil:
+		default:
+		}
+	} else {
+		err := fmt.Errorf("аутентификация отклонена: %s", resp.RetMsg)
+		ws.getLogger().Error("auth failed",
+			zap.String("retMsg", resp.RetMsg),
+		)
+		select {
+		case ws.authResultCh <- err:
+		default:
+		}
+	}
+}
+
 // WsPrivatePositionMessage представляет сообщение позиции.
 type WsPrivatePositionMessage struct {
-	Topic string                   `json:"topic"`
+	Topic string                  `json:"topic"`
 	Data  []WsPrivatePositionData `json:"data"`
 }
 
@@ -488,9 +570,17 @@ type WsPrivatePositionData struct {
 
 // handlePositionMessage обрабатывает сообщение о позиции.
 //
-// Ключевой метод для мониторинга ликвидаций согласно TZ.md 2.5C:
-// "Ликвидация: Если биржа ликвидировала одну позицию →
-//  Немедленно закрыть вторую позицию"
+// ВАЖНО: Этот метод НЕ определяет ликвидации! Проверка size == 0 ненадёжна,
+// так как позиция может обнулиться при:
+//   - Обычном закрытии ордером
+//   - Частичном закрытии (если это последняя часть)
+//   - Принудительной ликвидации биржей
+//
+// Для надёжной детекции ликвидаций используется handleExecutionMessage,
+// где есть поле isLiquidation согласно API Bybit.
+//
+// Согласно TZ.md 2.5C: "Ликвидация: Если биржа ликвидировала одну позицию →
+// Немедленно закрыть вторую позицию"
 func (ws *PrivateWebSocketClient) handlePositionMessage(data []byte) {
 	var msg WsPrivatePositionMessage
 	if err := jsonFast.Unmarshal(data, &msg); err != nil {
@@ -523,6 +613,9 @@ func (ws *PrivateWebSocketClient) handlePositionMessage(data []byte) {
 		}
 
 		// Создаём событие позиции
+		// ВАЖНО: IsLiquidated НЕ устанавливается здесь!
+		// Надёжная детекция ликвидаций происходит через execution сообщения
+		// с флагом isLiquidation от API Bybit.
 		event := &PositionEvent{
 			Symbol:        pos.Symbol,
 			Side:          side,
@@ -531,17 +624,16 @@ func (ws *PrivateWebSocketClient) handlePositionMessage(data []byte) {
 			UnrealizedPNL: unrealizedPNL,
 			LiqPrice:      liqPrice,
 			PositionIdx:   pos.PositionIdx,
-			IsLiquidated:  size == 0, // Ликвидация = размер стал 0
+			IsLiquidated:  false, // Детекция через execution, не через size == 0
 			Timestamp:     time.UnixMilli(updatedMs),
 		}
 
-		// Логируем ликвидации
-		if event.IsLiquidated {
-			ws.getLogger().Warn("обнаружена ликвидация позиции",
+		// Логируем закрытие позиции (но НЕ как ликвидацию)
+		if size == 0 {
+			ws.getLogger().Info("позиция закрыта (проверьте execution для детекции ликвидации)",
 				zap.String("symbol", event.Symbol),
 				zap.String("side", string(event.Side)),
 			)
-			metrics.IncrementWebSocketEvent(ExchangeName, event.Symbol, "liquidation")
 		}
 
 		// Вызываем callback
@@ -569,6 +661,9 @@ type WsPrivateExecutionData struct {
 }
 
 // handleExecutionMessage обрабатывает сообщение об исполнении ордера.
+//
+// Это ОСНОВНОЙ метод для детекции ликвидаций согласно TZ.md 2.5C.
+// Bybit API возвращает флаг isLiquidation=true для принудительных ликвидаций.
 func (ws *PrivateWebSocketClient) handleExecutionMessage(data []byte) {
 	var msg WsPrivateExecutionMessage
 	if err := jsonFast.Unmarshal(data, &msg); err != nil {
@@ -606,21 +701,88 @@ func (ws *PrivateWebSocketClient) handleExecutionMessage(data []byte) {
 			ExecQty:       execQty,
 			ExecPrice:     execPrice,
 			OrderStatus:   convertOrderStatus(exec.OrderStatus),
-			IsLiquidation: exec.IsLiquidation,
+			IsLiquidation: exec.IsLiquidation, // Надёжный флаг ликвидации от API Bybit
 			Timestamp:     time.UnixMilli(execMs),
 		}
 
-		// Логируем ликвидации
+		// Логируем и записываем метрику ликвидации
+		// Согласно TZ.md 2.5C: "Ликвидация: Если биржа ликвидировала одну позицию →
+		// Немедленно закрыть вторую позицию"
 		if event.IsLiquidation {
-			ws.getLogger().Warn("исполнение по ликвидации",
+			ws.getLogger().Error("ЛИКВИДАЦИЯ ОБНАРУЖЕНА через execution API",
 				zap.String("symbol", event.Symbol),
 				zap.String("orderId", event.OrderID),
 				zap.Float64("qty", event.ExecQty),
 				zap.Float64("price", event.ExecPrice),
+				zap.String("side", string(event.Side)),
 			)
+			// Инкрементируем метрику ликвидаций
+			metrics.IncrementWebSocketEvent(ExchangeName, event.Symbol, "liquidation")
 		}
 
 		callback(event)
+	}
+}
+
+// WsPrivateWalletMessage представляет сообщение обновления баланса.
+type WsPrivateWalletMessage struct {
+	Topic string                 `json:"topic"`
+	Data  []WsPrivateWalletData `json:"data"`
+}
+
+// WsPrivateWalletData представляет данные баланса.
+type WsPrivateWalletData struct {
+	AccountType string                  `json:"accountType"`
+	Coin        []WsPrivateWalletCoin   `json:"coin"`
+}
+
+// WsPrivateWalletCoin представляет баланс одной монеты.
+type WsPrivateWalletCoin struct {
+	Coin            string `json:"coin"`
+	WalletBalance   string `json:"walletBalance"`
+	AvailableToWithdraw string `json:"availableToWithdraw"`
+	UnrealisedPnl   string `json:"unrealisedPnl"`
+}
+
+// handleWalletMessage обрабатывает сообщение об обновлении баланса.
+//
+// Используется для real-time мониторинга маржи согласно требованиям TZ.md.
+func (ws *PrivateWebSocketClient) handleWalletMessage(data []byte) {
+	var msg WsPrivateWalletMessage
+	if err := jsonFast.Unmarshal(data, &msg); err != nil {
+		ws.getLogger().Warn("ошибка парсинга wallet сообщения",
+			zap.Error(err),
+		)
+		return
+	}
+
+	cb := ws.walletCallback.Load()
+	if cb == nil {
+		return // Callback не установлен
+	}
+
+	callback := cb.(func(*WalletEvent))
+
+	for _, wallet := range msg.Data {
+		for _, coin := range wallet.Coin {
+			walletBalance, _ := ParseFloat(coin.WalletBalance)
+			availableMargin, _ := ParseFloat(coin.AvailableToWithdraw)
+			unrealizedPNL, _ := ParseFloat(coin.UnrealisedPnl)
+
+			event := &WalletEvent{
+				AccountType:     wallet.AccountType,
+				Coin:            coin.Coin,
+				WalletBalance:   walletBalance,
+				AvailableMargin: availableMargin,
+				UnrealizedPNL:   unrealizedPNL,
+				Timestamp:       time.Now(),
+			}
+
+			// Обновляем метрику баланса
+			metrics.SetExchangeBalance(ExchangeName, coin.Coin, walletBalance)
+
+			callback(event)
+		}
 	}
 }
 
@@ -780,13 +942,28 @@ func (ws *PrivateWebSocketClient) reconnect() {
 		ws.conn = conn
 		ws.stopLoopCh = make(chan struct{})
 		ws.connected.Store(true)
+		// Пересоздаём канал для результата аутентификации
+		ws.authResultCh = make(chan error, 1)
 		ws.mu.Unlock()
 
-		// Аутентификация
+		// ВАЖНО: Сначала запускаем горутины для обработки сообщений,
+		// чтобы получить ответ на аутентификацию
+		ws.wg.Add(2)
+		go ws.runMessageLoop()
+		go ws.runPingLoop()
+
+		// Аутентификация с ожиданием подтверждения
 		if err := ws.authenticate(); err != nil {
 			ws.getLogger().Error("ошибка аутентификации при reconnect",
 				zap.Error(err),
 			)
+			// Останавливаем горутины и пробуем снова
+			ws.mu.Lock()
+			close(ws.stopLoopCh)
+			ws.conn.Close()
+			ws.conn = nil
+			ws.connected.Store(false)
+			ws.mu.Unlock()
 			continue
 		}
 
@@ -800,10 +977,6 @@ func (ws *PrivateWebSocketClient) reconnect() {
 		ws.getLogger().Info("приватный WebSocket переподключён",
 			zap.Int("attempt", attempt),
 		)
-
-		ws.wg.Add(2)
-		go ws.runMessageLoop()
-		go ws.runPingLoop()
 
 		return
 	}
@@ -883,6 +1056,16 @@ func (ws *PrivateWebSocketClient) SetPositionCallback(callback func(*PositionEve
 func (ws *PrivateWebSocketClient) SetExecutionCallback(callback func(*ExecutionEvent)) {
 	if callback != nil {
 		ws.executionCallback.Store(callback)
+	}
+}
+
+// SetWalletCallback устанавливает callback для обновлений баланса.
+// Потокобезопасен.
+//
+// Используется для real-time мониторинга маржи согласно требованиям TZ.md.
+func (ws *PrivateWebSocketClient) SetWalletCallback(callback func(*WalletEvent)) {
+	if callback != nil {
+		ws.walletCallback.Store(callback)
 	}
 }
 
