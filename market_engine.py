@@ -377,19 +377,19 @@ class MarketEngine:
         early_exit: bool = True,
     ) -> Optional[Dict]:
         """
-        Найти лучшую арбитражную возможность среди всех пар бирж.
-        
-        Оптимизации:
-        - Кэширование результатов check_spread
-        - Параллельная проверка пар бирж
-        - Ранний выход при нахождении хорошего спреда
-        
+        Найти лучшую арбитражную возможность O(N) алгоритм.
+
+        Оптимизация:
+        - Один проход по биржам для поиска лучших цен покупки/продажи
+        - Один вызов check_spread для найденной пары
+        - Сложность O(N) вместо O(N²)
+
         Args:
             symbol: Торговая пара
             volume_in_coin: Объём в базовой валюте
             exchanges: Список бирж (или все из TAKER_FEES)
             min_spread_pct: Минимальный порог спреда
-            early_exit: Выходить рано при нахождении спреда >= EARLY_EXIT_SPREAD_THRESHOLD
+            early_exit: Не используется (для обратной совместимости)
         """
         if volume_in_coin <= 0:
             return None
@@ -404,70 +404,77 @@ class MarketEngine:
         if len(ex_list) < 2:
             return None
 
-        # Генерируем все пары бирж
-        pairs_to_check = [
-            (be, se) 
-            for be in ex_list 
-            for se in ex_list 
-            if be != se
-        ]
-        
-        total_pairs = len(pairs_to_check)
-        best: Optional[Dict] = None
+        # ШАГ 1: Найти лучшую цену покупки и лучшую цену продажи - O(N)
+        best_buy_price = float('inf')
+        best_buy_exchange = None
+        best_sell_price = 0.0
+        best_sell_exchange = None
 
-        # Проверяем пары батчами для контролируемого параллелизма
-        for i in range(0, total_pairs, MAX_PARALLEL_CHECKS):
-            batch = pairs_to_check[i:i + MAX_PARALLEL_CHECKS]
-            
-            # Создаём задачи для параллельной проверки
-            tasks = [
-                self.check_spread(symbol, be, se, volume_in_coin, use_cache=True)
-                for be, se in batch
-            ]
-            
-            # Выполняем параллельно
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Обрабатываем результаты
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.warning(f"[SPREAD CHECK] Exception: {result}")
-                    continue
-                    
-                if not result:
-                    continue
-                    
-                if result["net_full_spread_pct"] < min_spread_pct:
-                    continue
-                    
-                if best is None or result["net_full_spread_pct"] > best["net_full_spread_pct"]:
-                    best = result
-                    
-                    # Ранний выход если нашли очень хороший спред
-                    if early_exit and best["net_full_spread_pct"] >= EARLY_EXIT_SPREAD_THRESHOLD:
-                        logger.debug(
-                            f"[EARLY EXIT {symbol}] Found spread "
-                            f"{best['net_full_spread_pct']}% >= {EARLY_EXIT_SPREAD_THRESHOLD}%"
-                        )
-                        break
-            
-            # Проверяем условие раннего выхода после батча
-            if early_exit and best and best["net_full_spread_pct"] >= EARLY_EXIT_SPREAD_THRESHOLD:
-                break
+        for ex in ex_list:
+            # Получаем стакан
+            ob = self._get_orderbook(ex, symbol)
+            if not ob or not self._is_book_fresh(ob):
+                continue
+
+            # Для покупки (LONG) нам нужны asks - мы покупаем по ask
+            buy_price = self._get_side_price(ob, "buy", volume_in_coin)
+            if buy_price and buy_price < best_buy_price:
+                best_buy_price = buy_price
+                best_buy_exchange = ex
+
+            # Для продажи (SHORT) нам нужны bids - мы продаём по bid
+            sell_price = self._get_side_price(ob, "sell", volume_in_coin)
+            if sell_price and sell_price > best_sell_price:
+                best_sell_price = sell_price
+                best_sell_exchange = ex
+
+        # ШАГ 2: Если не нашли обе биржи или они совпадают - выход
+        if not best_buy_exchange or not best_sell_exchange:
+            duration_ms = (time.time() - start_time) * 1000
+            self.metrics.record_scan(duration_ms, len(ex_list))
+            return None
+
+        if best_buy_exchange == best_sell_exchange:
+            duration_ms = (time.time() - start_time) * 1000
+            self.metrics.record_scan(duration_ms, len(ex_list))
+            logger.debug(
+                f"[{symbol}] Лучшие цены на одной бирже {best_buy_exchange}, арбитраж невозможен"
+            )
+            return None
+
+        # ШАГ 3: Проверка аномалии (цена продажи ниже цены покупки)
+        if best_sell_price < best_buy_price:
+            duration_ms = (time.time() - start_time) * 1000
+            self.metrics.record_scan(duration_ms, len(ex_list))
+            logger.debug(
+                f"[ANOMALY {symbol}] sell_price({best_sell_price:.6f}) < buy_price({best_buy_price:.6f})"
+            )
+            return None
+
+        # ШАГ 4: Рассчитать спред для найденной пары - всего 1 вызов!
+        result = await self.check_spread(
+            symbol=symbol,
+            buy_exchange=best_buy_exchange,
+            sell_exchange=best_sell_exchange,
+            volume_in_coin=volume_in_coin,
+            use_cache=False,  # Стаканы только что получены, кэш не нужен
+        )
 
         # Записываем метрики
         duration_ms = (time.time() - start_time) * 1000
-        self.metrics.record_scan(duration_ms, total_pairs)
-        
-        if best:
+        self.metrics.record_scan(duration_ms, len(ex_list))
+
+        # Проверяем порог спреда
+        if result and result["net_full_spread_pct"] >= min_spread_pct:
             self.metrics.opportunities_found += 1
             logger.info(
-                f"[BEST {symbol}] {best['buy_exchange']}->{best['sell_exchange']} | "
-                f"net_full={best['net_full_spread_pct']}% (>= {min_spread_pct}%) | "
-                f"scan={duration_ms:.1f}ms"
+                f"[BEST {symbol}] {result['buy_exchange']}->{result['sell_exchange']} | "
+                f"net_full={result['net_full_spread_pct']}% (>= {min_spread_pct}%) | "
+                f"scan={duration_ms:.1f}ms | O(N) алгоритм"
             )
+            return result
 
-        return best
+        return None
 
     # ============================================================
     # Быстрая проверка: есть ли вообще возможность
