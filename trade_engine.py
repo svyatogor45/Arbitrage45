@@ -759,7 +759,36 @@ class TradeEngine:
         # Объём SHORT должен соответствовать реально исполненному LONG
         # ------------------------------------------------------------
         short_volume = long_filled if long_filled > 0 else volume
-        
+
+        # ИСПРАВЛЕНИЕ баг #14: Проверяем минимальный размер SHORT после корректировки
+        if short_volume != volume:
+            min_ok_short_adj, min_reason_short_adj, min_amount_short_adj = await self._check_min_order_size(
+                short_ex, symbol, short_volume, sell_price
+            )
+
+            if not min_ok_short_adj:
+                logger.error(
+                    f"❌ ENTRY FAILED {symbol} | SHORT после корректировки below min: {min_reason_short_adj}, "
+                    f"min_amount={min_amount_short_adj}, adjusted_volume={short_volume} (was {volume})"
+                )
+                # Аварийно закрываем LONG
+                close_result = await self._emergency_close_leg(
+                    exchange=long_ex,
+                    symbol=symbol,
+                    side="sell",
+                    amount=long_filled,
+                    leg_label="emergency_close_long_below_min_short",
+                    pair_id=pair_id,
+                )
+
+                return {
+                    "success": False,
+                    "entry_long_order": long_order,
+                    "entry_short_order": None,
+                    "error": f"short_below_min_after_adjustment:{min_reason_short_adj}",
+                    "imbalance": None,
+                }
+
         short_order = await self._order_with_retries(
             short_ex,
             symbol,
@@ -1013,49 +1042,70 @@ class TradeEngine:
         if long_success and short_success:
             long_filled = long_order.get("filled") or 0.0
             short_filled = short_order.get("filled") or 0.0
-            
+
             logger.success(
                 f"✅ EXIT SUCCESS | LONG closed={long_filled}, SHORT closed={short_filled}"
             )
-            
+
+            # ИСПРАВЛЕНИЕ баг #15: Добавляем filled_long и filled_short в возврат
             return {
                 "success": True,
                 "exit_long_order": long_order,
                 "exit_short_order": short_order,
+                "filled_long": long_filled,
+                "filled_short": short_filled,
                 "error": None,
             }
 
         # Одна или обе ноги не закрылись
         error_parts = []
-        
+
         if not long_success:
+            # ИСПРАВЛЕНИЕ баг #16: Сохраняем только незакрытый остаток
+            long_filled = long_order.get("filled") or 0.0
+            long_remaining = max(0.0, long_amount - long_filled)
+
             error_parts.append(f"long_failed:{long_order.get('msg')}")
-            # ИСПРАВЛЕНО: добавлен pair_id, убран await
-            self.db.save_emergency_position(
-                pair_id=pair_id or 0,
-                exchange=long_ex,
-                symbol=symbol,
-                side="long",
-                amount=long_amount,
-                reason="exit_long_failed",
-            )
-        
+
+            if long_remaining > 0:
+                self.db.save_emergency_position(
+                    pair_id=pair_id or 0,
+                    exchange=long_ex,
+                    symbol=symbol,
+                    side="long",
+                    amount=long_remaining,  # Остаток, а не полный объём
+                    reason="exit_long_failed",
+                )
+                logger.warning(
+                    f"💾 EMERGENCY LONG saved: requested={long_amount}, "
+                    f"filled={long_filled}, remaining={long_remaining}"
+                )
+
         if not short_success:
+            # ИСПРАВЛЕНИЕ баг #16: Сохраняем только незакрытый остаток
+            short_filled = short_order.get("filled") or 0.0
+            short_remaining = max(0.0, short_amount - short_filled)
+
             error_parts.append(f"short_failed:{short_order.get('msg')}")
-            # ИСПРАВЛЕНО: добавлен pair_id, убран await
-            self.db.save_emergency_position(
-                pair_id=pair_id or 0,
-                exchange=short_ex,
-                symbol=symbol,
-                side="short",
-                amount=short_amount,
-                reason="exit_short_failed",
-            )
-        
+
+            if short_remaining > 0:
+                self.db.save_emergency_position(
+                    pair_id=pair_id or 0,
+                    exchange=short_ex,
+                    symbol=symbol,
+                    side="short",
+                    amount=short_remaining,  # Остаток, а не полный объём
+                    reason="exit_short_failed",
+                )
+                logger.warning(
+                    f"💾 EMERGENCY SHORT saved: requested={short_amount}, "
+                    f"filled={short_filled}, remaining={short_remaining}"
+                )
+
         error = "|".join(error_parts)
-        
+
         logger.error(f"❌ EXIT FAILED | {error}")
-        
+
         return {
             "success": False,
             "exit_long_order": long_order,
