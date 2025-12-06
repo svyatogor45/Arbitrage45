@@ -11,6 +11,7 @@
 
 import asyncio
 import time
+import threading
 from typing import Dict, Optional, Any, Callable, Tuple
 from dataclasses import dataclass, field
 
@@ -64,6 +65,9 @@ class ExchangeHealth:
     requests_failed: int = 0
     rate_limit_hits: int = 0
     markets_loaded: int = 0
+
+    # ИСПРАВЛЕНИЕ баг #10: Thread-safety для счётчиков
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     
     @property
     def success_rate(self) -> float:
@@ -81,17 +85,18 @@ class ExchangeHealth:
         return self.success_rate > 90
     
     def record_request(self, success: bool, error_msg: str = ""):
-        """Записать результат запроса."""
-        self.requests_total += 1
-        self.last_request_ts = time.time()
-        
-        if success:
-            self.requests_success += 1
-            self.last_success_ts = time.time()
-        else:
-            self.requests_failed += 1
-            self.last_error_ts = time.time()
-            self.last_error_msg = error_msg
+        """Записать результат запроса (thread-safe)."""
+        with self._lock:
+            self.requests_total += 1
+            self.last_request_ts = time.time()
+
+            if success:
+                self.requests_success += 1
+                self.last_success_ts = time.time()
+            else:
+                self.requests_failed += 1
+                self.last_error_ts = time.time()
+                self.last_error_msg = error_msg
     
     def to_dict(self) -> dict:
         return {

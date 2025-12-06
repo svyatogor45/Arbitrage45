@@ -471,6 +471,10 @@ class DBManager:
         actual_short_volume: Optional[float] = None,
     ) -> bool:
         """Сохранить или обновить активную позицию."""
+        # ИСПРАВЛЕНИЕ баг #11: Конвертируем None в 0.0 для БД
+        actual_long_volume = actual_long_volume if actual_long_volume is not None else 0.0
+        actual_short_volume = actual_short_volume if actual_short_volume is not None else 0.0
+
         return self._execute(
             """
             INSERT INTO positions (

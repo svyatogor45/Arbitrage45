@@ -164,10 +164,14 @@ class RiskController:
         """
         Пересчитать лимиты из текущего состояния пар.
         Вызывается в начале каждого тика.
+
+        ИСПРАВЛЕНО: создаём snapshot для избежания race condition.
         """
         async with self._lock:
+            # Создаём snapshot для безопасной итерации (защита от race condition)
+            snapshot = dict(pair_states)
             self._open_pairs_count = sum(
-                1 for s in pair_states.values()
+                1 for s in snapshot.values()
                 if s.open_parts > 0
             )
             try:
@@ -397,6 +401,18 @@ async def main():
     # Запуск WebSocket-потоков (в фоне)
     asyncio.create_task(ws_manager.start())
     logger.info("📡 WebSocket менеджер запущен")
+
+    # ИСПРАВЛЕНИЕ баг #6: Периодическая очистка кэша спредов
+    async def periodic_cache_cleanup():
+        """Очистка устаревших записей из кэша спредов MarketEngine."""
+        while not shutdown_mgr.is_shutdown_requested:
+            await asyncio.sleep(60)  # каждую минуту
+            try:
+                market.cleanup_stale_cache()
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка очистки кэша спредов: {e}")
+
+    asyncio.create_task(periodic_cache_cleanup())
 
     # Состояния пар в памяти: pair_id -> PairState
     pair_states: Dict[int, PairState] = {}
@@ -965,6 +981,18 @@ async def handle_state_hold(
     symbol = state.symbol
     open_volume = state.open_volume
 
+    # Защита от деления на ноль - проверяем, что массивы цен не пустые
+    if not state.entry_prices_long or not state.entry_prices_short:
+        logger.error(
+            f"[{state.pair_id}] HOLD: пустые массивы цен входа! "
+            f"long={len(state.entry_prices_long)}, short={len(state.entry_prices_short)}"
+        )
+        # Сбрасываем позицию и переводим в ERROR
+        db.delete_position(state.pair_id)
+        state.reset_after_exit()
+        state.status = STATE_ERROR
+        return
+
     # Средние цены входа
     avg_long_entry = sum(state.entry_prices_long) / len(state.entry_prices_long)
     avg_short_entry = sum(state.entry_prices_short) / len(state.entry_prices_short)
@@ -1118,6 +1146,12 @@ async def handle_state_exiting(
 
     if res["success"]:
         state.closed_parts += 1
+
+        # ИСПРАВЛЕНИЕ баг #9: Корректируем фактические объёмы при частичном выходе
+        if state.actual_long_volume > 0:
+            state.actual_long_volume = max(0.0, state.actual_long_volume - volume_to_close)
+        if state.actual_short_volume > 0:
+            state.actual_short_volume = max(0.0, state.actual_short_volume - volume_to_close)
 
         # Для оценки итогового PnL сохраняем текущие цены выхода
         pos_prices = await market.get_position_prices(
