@@ -39,31 +39,31 @@
 
 | Требование | Статус | Комментарий |
 |------------|--------|-------------|
-| Только USDT-перпетуальные фьючерсы | | |
-| Расчёты в USDT | | |
+| Только USDT-перпетуальные фьючерсы | ✅ | `config.py:99` - `DEFAULT_MARKET_TYPE = "swap"` |
+| Расчёты в USDT | ✅ | Все PnL, спреды, комиссии считаются в USDT |
 
 ### 2.3. Расчёт спреда
 
 | Требование | Статус | Комментарий |
 |------------|--------|-------------|
-| Средняя цена по 10 уровням asks/bids | | |
-| Запрет входа при недостатке объёма | | |
-| Учёт комиссий (4x taker fee) | | |
-| Net_spread = Spread - Total_fees | | |
+| Средняя цена по 10 уровням asks/bids | ❌ | **BUG:** Используется только 5 уровней (см. п.2.1). `market_engine.py` использует все переданные уровни, но получает max 5 |
+| Запрет входа при недостатке объёма | ✅ | `market_engine.py:198` - `min_fill_ratio = 0.98`, возвращает None при недостатке ликвидности |
+| Учёт комиссий (4x taker fee) | ✅ | `market_engine.py:339` - `full_cycle_fees = entry_fees * 2` (вход + выход = 4 комиссии) |
+| Net_spread = Spread - Total_fees | ✅ | `market_engine.py:342` - `net_full = raw_spread_pct - full_cycle_fees` |
 
 ### 2.4. Параметры пары
 
 | Требование | Статус | Комментарий |
 |------------|--------|-------------|
-| PairConfig структура | | |
-| Статусы: PAUSED, READY, ENTERING, POSITION_OPEN, EXITING, ERROR | | |
+| PairConfig структура | ✅ | `database.py:114-131` - все поля есть: symbol, volume, entry_spread, exit_spread, n_orders, stop_loss |
+| Статусы: PAUSED, READY, ENTERING, POSITION_OPEN, EXITING, ERROR | ⚠️ | **MISMATCH:** Используются другие названия: `paused`/`active` в БД, `ENTERING`/`EXITING`/`HOLD` для позиций. Нет явного `ERROR` статуса. `db_manager.py:676-681` |
 
 ### 2.5. Ордера
 
 | Требование | Статус | Комментарий |
 |------------|--------|-------------|
-| Только market ордера | | |
-| reduceOnly для выхода | | |
+| Только market ордера | ✅ | `exchange_manager.py:574` - `type="market"` |
+| reduceOnly для выхода | ✅ | `trade_engine.py:474, 1024, 1033` - `reduceOnly: True` для закрытия позиций |
 
 ### 2.6. Алгоритм входа
 
