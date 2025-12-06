@@ -69,31 +69,31 @@
 
 | Требование | Статус | Комментарий |
 |------------|--------|-------------|
-| Проверка Net_spread >= EntrySpread | | |
-| Проверка ликвидности | | |
-| Проверка баланса/маржи | | |
-| Вход частями (NumOrders) | | |
-| Обработка ошибок с retry | | |
-| Закрытие первой ноги при неудаче второй | | |
+| Проверка Net_spread >= EntrySpread | ✅ | `main.py:868` - `if net_spread < state.entry_spread` |
+| Проверка ликвидности | ✅ | `market_engine.py:238-243` - VWAP возвращает None при недостатке |
+| Проверка баланса/маржи | ✅ | `trade_engine.py:406-431` - `_check_balance()` проверяет USDT |
+| Вход частями (NumOrders) | ✅ | `main.py:67,91` - `n_orders`, `part_volume = total_volume / n_orders` |
+| Обработка ошибок с retry | ✅ | `trade_engine.py:230-318` - backoff 0.5s, 1s, 2s (соответствует требованиям!) |
+| Закрытие первой ноги при неудаче второй | ✅ | `trade_engine.py:895-922` - `_emergency_close_leg()` с сохранением в БД |
 
 ### 2.7. Сопровождение позиции
 
 | Требование | Статус | Комментарий |
 |------------|--------|-------------|
-| Мониторинг каждую секунду | | |
-| Расчёт нереализованного PnL | | |
-| Выход по целевому спреду | | |
-| Stop Loss | | |
-| Обработка ликвидации | | |
+| Мониторинг каждую секунду | ✅ | `config.py:141` - `PRICE_UPDATE_INTERVAL = 1.0`, используется в `main.py:477,566` |
+| Расчёт нереализованного PnL | ✅ | `main.py:1014-1016` - корректный расчёт pnl_long + pnl_short |
+| Выход по целевому спреду | ✅ | `main.py:1029` - `is_tp = net_spread <= state.exit_spread` |
+| Stop Loss | ✅ | `main.py:1019` - `is_sl = state.stop_loss > 0 and total_pnl <= -state.stop_loss` |
+| Обработка ликвидации | ❌ | **BUG:** Не реализовано! Нет подписки на события ликвидации от бирж и обработки |
 
 ### 2.8. Алгоритм выхода
 
 | Требование | Статус | Комментарий |
 |------------|--------|-------------|
-| Выход частями | | |
-| Проверка Net_spread <= ExitSpread | | |
-| reduceOnly ордера | | |
-| Статистика и realized PnL | | |
+| Выход частями | ✅ | `main.py:1093-1149` - `handle_state_exiting()` закрывает по `part_volume` |
+| Проверка Net_spread <= ExitSpread | ✅ | `main.py:1130` - `if net_spread > state.exit_spread: return` |
+| reduceOnly ордера | ✅ | `trade_engine.py:1024,1033` - `reduceOnly: True` для exit |
+| Статистика и realized PnL | ✅ | `main.py:1047` - `db.update_pair_pnl()` после закрытия |
 
 ### 2.9. Плавающее состояние
 
