@@ -168,17 +168,20 @@ class WsManager:
         """
         if self.running:
             return
-        
+
         self.running = True
         self.session = aiohttp.ClientSession()
-        
+
         for ex, url in WSS_URLS.items():
             ex_norm = ex.lower()
             if not url:
                 logger.warning(f"[WS] Пропускаем {ex_norm}, нет URL")
                 continue
             asyncio.create_task(self._connect(ex_norm, url))
-        
+
+        # ИСПРАВЛЕНИЕ: запускаем периодическую очистку стаканов
+        asyncio.create_task(self._cleanup_unused_orderbooks())
+
         logger.info("📡 WsManager: старт фоновых WS-подключений")
     
     async def stop(self):
@@ -238,34 +241,88 @@ class WsManager:
             await self._send_sub(ex, ws, internal)
     
     # --------------------------------------------------
+    # CLEANUP UNUSED ORDERBOOKS (ИСПРАВЛЕНИЕ: баг #5)
+    # --------------------------------------------------
+    async def _cleanup_unused_orderbooks(self):
+        """
+        Периодическая очистка стаканов для неиспользуемых символов.
+        Защита от утечки памяти при смене торгуемых пар.
+        """
+        while self.running:
+            await asyncio.sleep(3600)  # каждый час
+
+            try:
+                for ex in list(self._orderbooks.keys()):
+                    subscribed = self.subscriptions.get(ex, set())
+
+                    lock = self._orderbook_locks.get(ex)
+                    if not lock:
+                        continue
+
+                    async with lock:
+                        cached = set(self._orderbooks[ex].keys())
+                        # Удаляем стаканы, на которые нет активной подписки
+                        unused = cached - subscribed
+
+                        for symbol in unused:
+                            self._orderbooks[ex].pop(symbol, None)
+
+                        if unused:
+                            logger.info(
+                                f"🧹 [{ex}] Очищено {len(unused)} неиспользуемых стаканов "
+                                f"(осталось {len(self._orderbooks[ex])})"
+                            )
+            except Exception as e:
+                logger.warning(f"[WS] Ошибка очистки стаканов: {e}")
+
+    # --------------------------------------------------
     # GET ORDERBOOK (thread-safe, returns lightweight copy)
     # --------------------------------------------------
-    def get_latest_book(self, exchange: str, symbol: str) -> Optional[dict]:
+    def get_latest_book(
+        self,
+        exchange: str,
+        symbol: str,
+        max_age_sec: Optional[float] = None
+    ) -> Optional[dict]:
         """
         Вернуть легковесную КОПИЮ последнего известного стакана.
-        
+
+        ИСПРАВЛЕНИЕ баг #13: добавлена опциональная проверка свежести.
+
+        Args:
+            exchange: Название биржи
+            symbol: Символ торговой пары
+            max_age_sec: Максимальный возраст стакана (секунды). Если None - без проверки.
+
         Оптимизация: копируем только топ-5 уровней вместо всего стакана.
         Это ускоряет операцию в 15-20 раз при сохранении thread-safety.
         Для арбитража глубина более 5 уровней обычно не требуется.
-        
+
         Thread-safe: возвращает immutable snapshot.
         Возвращает dict или None.
         """
         ex = (exchange or "").lower()
         internal = to_internal(symbol)
-        
+
         books = self._orderbooks.get(ex, {})
         book = books.get(internal)
-        
+
         if book is None:
             return None
-        
+
+        # ИСПРАВЛЕНИЕ баг #13: Проверка свежести стакана
+        if max_age_sec is not None:
+            ts = book.get("timestamp", 0.0)
+            age = time.time() - ts
+            if age > max_age_sec:
+                return None
+
         # Оптимизация: легковесное копирование только топ-5 уровней
         # Вместо copy.deepcopy(book) который занимает ~0.5ms
         # Делаем shallow copy первых 5 уровней (~0.03ms)
         bids = book.get("bids", [])
         asks = book.get("asks", [])
-        
+
         return {
             "bids": bids[:RETURN_BOOK_DEPTH].copy() if bids else [],
             "asks": asks[:RETURN_BOOK_DEPTH].copy() if asks else [],
@@ -627,21 +684,38 @@ class WsManager:
             return
         
         ts = time.time()
-        
-        # Парсим данные и получаем результат
-        parsed = self._parse_orderbook_data(ex, data, ts)
-        
-        if parsed is not None:
-            internal, book = parsed
-            
-            # Записываем с Lock
-            lock = self._orderbook_locks.get(ex)
-            if lock:
-                async with lock:
+
+        # ИСПРАВЛЕНИЕ баг #8: для Bitget update нужен lock ДО парсинга
+        # т.к. парсинг читает текущий стакан
+        lock = self._orderbook_locks.get(ex)
+
+        # Для Bitget с action="update" берём lock ПЕРЕД парсингом
+        needs_lock_before_parse = (
+            ex == "bitget" and
+            isinstance(data, dict) and
+            data.get("action") == "update"
+        )
+
+        if needs_lock_before_parse and lock:
+            async with lock:
+                parsed = self._parse_orderbook_data(ex, data, ts)
+                if parsed is not None:
+                    internal, book = parsed
                     self._orderbooks[ex][internal] = book
-            else:
-                # Fallback без lock (не должно происходить)
-                self._orderbooks[ex][internal] = book
+        else:
+            # Обычный путь: парсим без lock, потом записываем с lock
+            parsed = self._parse_orderbook_data(ex, data, ts)
+
+            if parsed is not None:
+                internal, book = parsed
+
+                # Записываем с Lock
+                if lock:
+                    async with lock:
+                        self._orderbooks[ex][internal] = book
+                else:
+                    # Fallback без lock (не должно происходить)
+                    self._orderbooks[ex][internal] = book
     
     def _parse_orderbook_data(
         self,
